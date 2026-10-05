@@ -65,7 +65,7 @@ func NewUDPServer(parentCtx context.Context, config *UdpConfig, logger *logrus.L
 		tunnels:        &udpConnTable{m: map[string]*TunnelUDPConn{}},
 		reqNewConnChan: make(chan struct{}, config.ChannelSize),
 		wg:             &sync.WaitGroup{},
-		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
+		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), parentCtx, config.SnifferLog, config.Sniffer, logger),
 	}
 
 	return server
@@ -79,9 +79,7 @@ func (s *UdpTransport) spawn(f func()) {
 func (s *UdpTransport) Start() {
 	s.usageMonitor.SetStatus("Disconnected (UDP)")
 
-	if s.config.WebPort > 0 {
-		s.spawn(s.usageMonitor.Monitor)
-	}
+	s.usageMonitor.Start(s.config.WebPort > 0)
 
 	s.spawn(s.channelHandshake)
 }
@@ -126,7 +124,6 @@ func (s *UdpTransport) Restart() {
 	s.wg = &sync.WaitGroup{}
 	s.tunnelChannel = make(chan *TunnelUDPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
-	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, s.logger)
 	s.controlChannel.Store(nil)
 	s.tunnels = &udpConnTable{m: map[string]*TunnelUDPConn{}}
 	s.rtt.Store(0)
@@ -360,7 +357,7 @@ func (s *UdpTransport) acceptTunnelConn(listener *net.UDPConn) {
 			}
 
 			// Initialize the payload channel for the new connection
-			payloadChan := make(chan []byte, 100_000)
+			payloadChan := make(chan []byte, udpFlowQueueSize)
 
 			// Create a new TunnelUDPConn
 			tunnelConn := TunnelUDPConn{
@@ -479,8 +476,8 @@ func (s *UdpTransport) localListener(localAddr, remoteAddr string) {
 				}
 				mu.Unlock()
 
-				// Create a new payload channel for this connection, Buffer up to 100,000 packets for the connection
-				payloadChan := make(chan []byte, 100_000)
+				// Create a new payload channel for this connection
+				payloadChan := make(chan []byte, udpFlowQueueSize)
 
 				// Build the UDP connection object
 				newUDPConn := LocalUDPConn{

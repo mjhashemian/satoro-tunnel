@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,7 +22,7 @@ import (
 )
 
 // freePort returns a currently unused TCP (and usually UDP) port on localhost.
-func freePort(t *testing.T) int {
+func freePort(t testing.TB) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -31,7 +33,7 @@ func freePort(t *testing.T) int {
 }
 
 // startTCPEcho starts a TCP echo server and returns its port.
-func startTCPEcho(t *testing.T) int {
+func startTCPEcho(t testing.TB) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -56,7 +58,7 @@ func startTCPEcho(t *testing.T) int {
 }
 
 // startUDPEcho starts a UDP echo server and returns its port.
-func startUDPEcho(t *testing.T) int {
+func startUDPEcho(t testing.TB) int {
 	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -84,7 +86,7 @@ type runner struct {
 	done   chan struct{}
 }
 
-func start(t *testing.T, config string) *runner {
+func start(t testing.TB, config string) *runner {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "config.toml")
@@ -117,11 +119,14 @@ type setup struct {
 	transport string
 	acceptUDP bool
 	udpTarget bool // forward to the UDP echo server instead of the TCP one
+	sniffer   bool // record per-port traffic on the server
+	webPort   int  // server web panel port, 0 = off
+	nodelay   bool // TCP_NODELAY on tunnel and local sockets (both sides)
 }
 
 // pair builds a matching server and client config. It returns the configs and the
 // local (user-facing) port on the server.
-func pair(t *testing.T, s setup) (serverCfg, clientCfg string, localPort int) {
+func pair(t testing.TB, s setup) (serverCfg, clientCfg string, localPort int) {
 	t.Helper()
 
 	tunnelPort := freePort(t)
@@ -139,22 +144,27 @@ transport = %q
 token = "e2e-token"
 heartbeat = 2
 accept_udp = %v
+nodelay = %v
+sniffer = %v
+sniffer_log = %q
+web_port = %d
 log_level = "error"
 skip_optz = true
 ports = ["127.0.0.1:%d=127.0.0.1:%d"]
-`, tunnelPort, s.transport, s.acceptUDP, localPort, target)
+`, tunnelPort, s.transport, s.acceptUDP, s.nodelay, s.sniffer, filepath.Join(t.TempDir(), "usage.json"), s.webPort, localPort, target)
 
 	clientCfg = fmt.Sprintf(`
 [client]
 remote_addr = "127.0.0.1:%d"
 transport = %q
 token = "e2e-token"
+nodelay = %v
 connection_pool = 4
 retry_interval = 1
 dial_timeout = 2
 log_level = "error"
 skip_optz = true
-`, tunnelPort, s.transport)
+`, tunnelPort, s.transport, s.nodelay)
 
 	return serverCfg, clientCfg, localPort
 }
@@ -214,7 +224,7 @@ func udpEcho(addr string, payload []byte) error {
 }
 
 // eventually retries check until it succeeds or the timeout passes.
-func eventually(t *testing.T, timeout time.Duration, what string, check func() error) {
+func eventually(t testing.TB, timeout time.Duration, what string, check func() error) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var err error
@@ -227,7 +237,7 @@ func eventually(t *testing.T, timeout time.Duration, what string, check func() e
 	t.Fatalf("%s: still failing after %v: %v", what, timeout, err)
 }
 
-func randomBytes(t *testing.T, n int) []byte {
+func randomBytes(t testing.TB, n int) []byte {
 	t.Helper()
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -237,7 +247,7 @@ func randomBytes(t *testing.T, n int) []byte {
 }
 
 // checkTCP verifies a small echo, then many concurrent larger transfers.
-func checkTCP(t *testing.T, addr string) {
+func checkTCP(t testing.TB, addr string) {
 	t.Helper()
 
 	eventually(t, 20*time.Second, "tunnel ready", func() error {
@@ -361,4 +371,110 @@ func TestBusyLocalPort(t *testing.T) {
 	blocker.Close()
 
 	checkTCP(t, addr)
+}
+
+// getJSON fetches url into v with a short timeout.
+func getJSON(url string, v any) error {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: status %d", url, resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+// TestPanelSurvivesRestart replaces the client (so the server restarts) while polling
+// the server's panel. The panel must answer throughout, and traffic counts must not reset.
+func TestPanelSurvivesRestart(t *testing.T) {
+	webPort := freePort(t)
+	serverCfg, clientCfg, localPort := pair(t, setup{transport: "tcp", sniffer: true, webPort: webPort})
+	addr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	panel := fmt.Sprintf("http://127.0.0.1:%d", webPort)
+
+	start(t, serverCfg)
+	client := start(t, clientCfg)
+	checkTCP(t, addr)
+
+	type stats struct {
+		TunnelStatus string `json:"tunnelStatus"`
+	}
+	type portRow struct {
+		Port  int
+		Usage uint64
+	}
+	usageOf := func() (uint64, error) {
+		var rows []portRow
+		if err := getJSON(panel+"/data", &rows); err != nil {
+			return 0, err
+		}
+		for _, r := range rows {
+			if r.Port == localPort {
+				return r.Usage, nil
+			}
+		}
+		return 0, nil
+	}
+
+	eventually(t, 10*time.Second, "panel up", func() error {
+		var s stats
+		return getJSON(panel+"/stats", &s)
+	})
+
+	before, err := usageOf()
+	if err != nil || before == 0 {
+		t.Fatalf("usage before restart = %d, %v; want traffic recorded", before, err)
+	}
+
+	// poll the panel for the whole restart
+	stop := make(chan struct{})
+	pollErrs := make(chan error, 1000)
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(100 * time.Millisecond):
+				var s stats
+				if err := getJSON(panel+"/stats", &s); err != nil {
+					pollErrs <- err
+				}
+			}
+		}
+	}()
+
+	client.stop()
+	start(t, clientCfg)
+	checkTCP(t, addr)
+
+	eventually(t, 10*time.Second, "status back to connected", func() error {
+		var s stats
+		if err := getJSON(panel+"/stats", &s); err != nil {
+			return err
+		}
+		if s.TunnelStatus != "Connected (TCP)" {
+			return fmt.Errorf("status %q", s.TunnelStatus)
+		}
+		return nil
+	})
+
+	close(stop)
+	<-pollDone
+	close(pollErrs)
+	for err := range pollErrs {
+		t.Errorf("panel request failed during the restart: %v", err)
+	}
+
+	after, err := usageOf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after <= before {
+		t.Fatalf("usage after restart = %d, want more than %d (counts must survive restarts)", after, before)
+	}
 }

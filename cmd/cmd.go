@@ -102,7 +102,7 @@ func Run(cfg *config.Config, ctx context.Context) {
 		// Wait for shutdown signal
 		<-ctx.Done()
 		srv.Stop()
-		logger.Println("shutting down server...")
+		utils.NewLogger(cfg.Server.LogLevel).Info("shutting down server...")
 		return
 	}
 
@@ -117,5 +117,5 @@ func Run(cfg *config.Config, ctx context.Context) {
 	// Wait for shutdown signal
 	<-ctx.Done()
 	clnt.Stop()
-	logger.Println("shutting down client...")
+	utils.NewLogger(cfg.Client.LogLevel).Info("shutting down client...")
 }

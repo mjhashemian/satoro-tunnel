@@ -14,6 +14,10 @@ import (
 	"github.com/mjhashemian/satoro-tunnel/config"
 )
 
+// wsBufferSize is the WebSocket read/write buffer size. gorilla's 4 KiB default splits
+// every write into many small frames.
+const wsBufferSize = 32 * 1024
+
 func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, mode config.TransportType, retry int, SO_RCVBUF int, SO_SNDBUF int) (*websocket.Conn, error) {
 	var tunnelWSConn *websocket.Conn
 	var err error
@@ -119,7 +123,9 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		wsURL = fmt.Sprintf("ws://%s%s", addr, path)
 
 		dialer = websocket.Dialer{
-			EnableCompression: true,
+			EnableCompression: false, // the server never negotiates it; tunnelled data is usually encrypted anyway
+			ReadBufferSize:    wsBufferSize,
+			WriteBufferSize:   wsBufferSize,     // frames are flushed when this fills, so it bounds frame size
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
 			NetDial: func(_, addr string) (net.Conn, error) {
 				conn, err := TcpDialer(ctx, edgeIP, "", timeout, keepalive, nodelay, 1, SO_RCVBUF, SO_SNDBUF, 0)
@@ -138,7 +144,9 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		}
 
 		dialer = websocket.Dialer{
-			EnableCompression: true,
+			EnableCompression: false, // the server never negotiates it; tunnelled data is usually encrypted anyway
+			ReadBufferSize:    wsBufferSize,
+			WriteBufferSize:   wsBufferSize,     // frames are flushed when this fills, so it bounds frame size
 			TLSClientConfig:   tlsConfig,        // Pass the insecure TLS config here
 			HandshakeTimeout:  45 * time.Second, // default handshake timeout
 			NetDial: func(_, addr string) (net.Conn, error) {

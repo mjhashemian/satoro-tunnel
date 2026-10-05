@@ -583,9 +583,9 @@ It shows:
 * **Throughput**: live download/upload rate of the server's network interface, with a chart of the last few minutes. Hover the chart for exact values.
 * **Tunnel facts**: total traffic carried by the tunnel, open connections, interface totals and sniffer state.
 * **Resource gauges**: CPU, memory, disk and swap usage.
-* **Traffic by port**: bytes transferred per mapped port and each port's share, with a filter. This needs `sniffer = true`. Usage is saved to `sniffer_log` every 15 seconds.
+* **Traffic by port**: bytes transferred per mapped port and each port's share, with a filter. This needs `sniffer = true`. The numbers update live and are saved to `sniffer_log` every 15 seconds and on shutdown, even when the panel itself is off.
 
-The panel follows your system's light/dark preference, and the toggle in the top-right corner remembers your choice.
+The panel follows your system's light/dark preference, and the toggle in the top-right corner remembers your choice. It stays up while the tunnel reconnects, and traffic counts carry over.
 
 > The panel has no login. Bind it to a trusted network or put it behind a firewall or reverse proxy with authentication.
 

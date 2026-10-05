@@ -61,7 +61,7 @@ func NewTCPClient(parentCtx context.Context, config *TcpConfig, logger *logrus.L
 		cancel:       cancel,
 		logger:       logger,
 		wg:           &sync.WaitGroup{},
-		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
+		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), parentCtx, config.SnifferLog, config.Sniffer, logger),
 		controlFlow:  make(chan struct{}, 100),
 	}
 
@@ -74,9 +74,7 @@ func (c *TcpTransport) spawn(f func()) {
 }
 
 func (c *TcpTransport) Start() {
-	if c.config.WebPort > 0 {
-		c.spawn(c.usageMonitor.Monitor)
-	}
+	c.usageMonitor.Start(c.config.WebPort > 0)
 
 	c.usageMonitor.SetStatus("Disconnected (TCP)")
 
@@ -122,7 +120,6 @@ func (c *TcpTransport) Restart() {
 	// Re-initialize variables
 	c.wg = &sync.WaitGroup{}
 	c.controlChannel.Store(nil)
-	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, c.logger)
 	atomic.StoreInt32(&c.poolConnections, 0)
 	atomic.StoreInt32(&c.loadConnections, 0)
 	c.controlFlow = make(chan struct{}, 100)

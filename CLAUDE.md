@@ -68,12 +68,14 @@ Every transport follows the same model:
 6. **Failure handling.** Any control-channel error calls `go s.Restart()`. Always use `go`: Restart waits for the workers, so a synchronous call from a worker deadlocks. Restart is guarded by `restartMutex.TryLock()` and does:
    - cancel ctx and close the control channel
    - wait (10s timeout) on the run's `wg`
-   - install a fresh `wg`, ctx, channels and `web.Usage`
+   - install a fresh `wg`, ctx and channels
    - call `Start()`
 
+   The `web.Usage` (panel, status, traffic counters) is **not** replaced: it is built once in the constructor from `parentCtx`, so it survives restarts.
+
 ### Concurrency rules (keep these when editing transports)
-- **Control-plane goroutines** (listeners, accept loops, handshake, channel handler and its reader, handle loops, mux sessions, keepalives, `Monitor`) must start via `s.spawn(...)`, so `Restart` can wait for them. They must exit when ctx is done: no unconditional blocking sends; use `select` with `<-ctx.Done()`.
-- **Data-plane goroutines** (copy handlers, client pooled tunnels) are not tracked. They must not read fields that `Restart` replaces (`ctx`, `usageMonitor`, channels, `udpConnTable`). Capture those at spawn time and pass them in. Client pooled tunnels close themselves on restart via `context.AfterFunc(ctx, conn.Close)`.
+- **Control-plane goroutines** (listeners, accept loops, handshake, channel handler and its reader, handle loops, mux sessions, keepalives) must start via `s.spawn(...)`, so `Restart` can wait for them. They must exit when ctx is done: no unconditional blocking sends; use `select` with `<-ctx.Done()`. The panel is not one of them: `usageMonitor.Start(webEnabled)` runs once (`sync.Once`) for the transport's lifetime.
+- **Data-plane goroutines** (copy handlers, client pooled tunnels) are not tracked. They must not read fields that `Restart` replaces (`ctx`, channels, `udpConnTable`). Capture those at spawn time and pass them in. Client pooled tunnels close themselves on restart via `context.AfterFunc(ctx, conn.Close)`.
 - Shared mutable state uses `utils.Locked` (`controlChannel`), atomics (`rtt`, counters, `IsCongested`), or `web.Usage.SetStatus` (tunnel status shown in the web UI).
 - Control readers must check `ctx.Err() == nil` before calling `Restart`, so a reader unblocked by a restart doesn't trigger another one.
 - Runtime listens go through `network.RetryListen` (backoff 1s→30s). Never `Fatalf` outside startup; config problems are rejected in `cmd.Load`.
@@ -89,12 +91,27 @@ Every transport follows the same model:
 `"443"`, `"443-600"`, `"443-600:5201"`, `"443-600=1.1.1.1:5201"`, `"4000=5000"`, `"127.0.0.2:443=1.1.1.1:5201"`. They are parsed only by `portmap.Parse` (table-tested in `portmap_test.go`). `cmd.Load` rejects invalid mappings at startup, and each server transport's `parsePortMappings` just loops over the result.
 
 ### Monitoring
-`web.NewDataStore(...)` is created per transport. If `web_port > 0` it serves:
+`web.NewDataStore(...)` is created once per transport. `Start(web)` runs its background work. If `web_port > 0` it serves:
 - `/`: the panel, `internal/web/index.html`, embedded as raw bytes (not a Go template)
-- `/stats`: system stats via gopsutil
-- `/data`: per-port usage; only registered when `sniffer = true`, otherwise 404
+- `/stats`: system stats collected in the background every 2s (socket count every 10s) and served from a cache; never collect in the request path
+- `/data`: per-port usage, live (saved totals plus unsaved counts); only registered when `sniffer = true`, otherwise 404
 
-Per-port byte counts are flushed to `sniffer_log` (default `satoro.json`) every 15s. `pprof = true` opens :6060 (server) or :6061 (client). The web UI has no authentication.
+Traffic counting:
+- Copy loops call `usage.PortCounter(port)` **once per connection** and `Add(n)` per write. Never take a lock per write. `AddOrUpdatePort` is a thin wrapper for the UDP paths.
+- With `sniffer = true`, counts are merged into `sniffer_log` (default `satoro.json`) every 15s and on shutdown, even when the panel is off.
+- Saves read-modify-write the file (so an old and a new instance during hot reload don't clobber each other) and replace it atomically (temp file + rename). A corrupt file is moved to `<sniffer_log>.corrupt`.
+
+`pprof = true` opens :6060 (server) or :6061 (client). The web UI has no authentication.
+
+### Data path (performance)
+`handlers.copyConn` picks one of three paths. Keep these when changing it, and check with `BenchmarkThroughput` (`internal/e2e/bench_test.go`):
+- **TCP↔TCP with no counting:** plain `io.Copy`, which uses `splice(2)` on Linux. Don't wrap either side.
+- **A source with its own `WriteTo`** (smux streams), except `*net.TCPConn`: use that, so no buffer is needed. TCPConn's fallback `WriteTo` allocates a buffer.
+- **Anything else:** `io.CopyBuffer` with a pooled 32 KiB buffer and `readerOnly`/`writerOnly` wrappers, so Go can't swap in an allocating path.
+
+WebSocket buffers are 32 KiB on both sides; gorilla's 4 KiB default produces tiny frames. UDP flow queues hold `udpFlowQueueSize` (4096) packets.
+
+Benchmarks: `go test -run '^$' -bench . -benchmem -count=6 ./internal/e2e/`, compared with `benchstat`.
 
 Panel rules:
 - `index.html` must stay **fully self-contained**: no CDN scripts, web fonts or external icons, because servers often can't reach them. Inline CSS/JS and SVG only.

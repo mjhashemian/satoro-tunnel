@@ -85,7 +85,7 @@ func NewTcpMuxServer(parentCtx context.Context, config *TcpMuxConfig, logger *lo
 		localChannel:     make(chan LocalTCPConn, config.ChannelSize),
 		reqNewConnChan:   make(chan struct{}, config.ChannelSize),
 		wg:               &sync.WaitGroup{},
-		usageMonitor:     web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
+		usageMonitor:     web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), parentCtx, config.SnifferLog, config.Sniffer, logger),
 	}
 
 	return server
@@ -101,9 +101,7 @@ func (s *TcpMuxTransport) Start() {
 }
 
 func (s *TcpMuxTransport) run() {
-	if s.config.WebPort > 0 {
-		s.spawn(s.usageMonitor.Monitor)
-	}
+	s.usageMonitor.Start(s.config.WebPort > 0)
 	s.usageMonitor.SetStatus("Disconnected (TCPMux)")
 
 	s.spawn(s.tunnelListener)
@@ -173,7 +171,6 @@ func (s *TcpMuxTransport) Restart() {
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
 	s.handshakeChannel = make(chan net.Conn)
 	s.controlChannel.Store(nil)
-	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, s.logger)
 	atomic.StoreInt32(&s.streamCounter, 0)
 	atomic.StoreInt32(&s.sessionCounter, 0)
 

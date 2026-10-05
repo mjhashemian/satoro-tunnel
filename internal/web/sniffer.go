@@ -9,6 +9,7 @@ import (
 	stdnet "net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -24,18 +25,39 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const (
+	saveInterval        = 15 * time.Second // how often per-port usage is merged into sniffer_log
+	statsInterval       = 2 * time.Second  // how often system stats are collected for the panel
+	connectionsInterval = 10 * time.Second // counting every socket is expensive, so do it less often
+)
+
+// Usage holds the per-port traffic counters, the tunnel status and the web panel.
+// A transport creates one Usage for its whole lifetime, so the counters and the panel
+// survive transport restarts.
 type Usage struct {
-	dataStore    sync.Map
-	listenAddr   string
-	shutdownCtx  context.Context
-	cancelFunc   context.CancelFunc
-	server       *http.Server
-	logger       *logrus.Logger
-	sniffer      bool
-	snifferLog   string
-	mu           sync.Mutex
-	totalTraffic atomic.Uint64
+	listenAddr string
+	ctx        context.Context // ends when the transport shuts down
+	logger     *logrus.Logger
+	sniffer    bool
+	snifferLog string
+	startOnce  sync.Once
+
+	pending sync.Map // int port -> *atomic.Uint64, bytes not yet saved
+
+	saveMu       sync.Mutex // serialises saves to snifferLog
+	totalsMu     sync.RWMutex
+	totals       map[int]uint64 // usage as of the last save, merged with snifferLog
+	totalsLoaded bool
+	totalTraffic atomic.Uint64 // sum of totals
+
 	tunnelStatus atomic.Pointer[string]
+
+	stats   atomic.Pointer[SystemStats] // latest collected system stats
+	statsMu sync.Mutex                  // guards the collector state below
+	lastNet *net.IOCountersStat
+	lastAt  time.Time
+	conns   int
+	connsAt time.Time
 }
 
 type PortUsage struct {
@@ -78,15 +100,16 @@ type PortUsageView struct {
 	ReadableUsage string
 }
 
-func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog string, sniffer bool, logger *logrus.Logger) *Usage {
-	ctx, cancel := context.WithCancel(shutdownCtx)
+// NewDataStore creates the usage store. ctx should live as long as the transport
+// (not a single run of it), so restarts keep the panel and the counters.
+func NewDataStore(listenAddr string, ctx context.Context, snifferLog string, sniffer bool, logger *logrus.Logger) *Usage {
 	u := &Usage{
-		listenAddr:  listenAddr,
-		shutdownCtx: ctx,
-		cancelFunc:  cancel,
-		logger:      logger,
-		sniffer:     sniffer,
-		snifferLog:  snifferLog,
+		listenAddr: listenAddr,
+		ctx:        ctx,
+		logger:     logger,
+		sniffer:    sniffer,
+		snifferLog: snifferLog,
+		totals:     map[int]uint64{},
 	}
 	u.SetStatus("")
 	return u
@@ -97,58 +120,103 @@ func (m *Usage) SetStatus(status string) {
 	m.tunnelStatus.Store(&status)
 }
 
-func (m *Usage) Monitor() {
+// PortCounter returns the counter for bytes transferred on port. Copy loops fetch it
+// once per connection and call Add per write; no lock is taken.
+func (m *Usage) PortCounter(port int) *atomic.Uint64 {
+	if v, ok := m.pending.Load(port); ok {
+		return v.(*atomic.Uint64)
+	}
+	v, _ := m.pending.LoadOrStore(port, new(atomic.Uint64))
+	return v.(*atomic.Uint64)
+}
+
+// AddOrUpdatePort records usage bytes for port.
+func (m *Usage) AddOrUpdatePort(port int, usage uint64) {
+	m.PortCounter(port).Add(usage)
+}
+
+// Start runs the background work once per Usage: saving per-port usage when the sniffer
+// is on, and the web panel when web is true. Later calls (e.g. after a restart) do nothing.
+func (m *Usage) Start(web bool) {
+	m.startOnce.Do(func() {
+		if m.sniffer {
+			go m.saveLoop()
+		}
+		if web {
+			go m.serve()
+		}
+	})
+}
+
+func (m *Usage) saveLoop() {
+	m.ensureTotals()
+
+	ticker := time.NewTicker(saveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.saveUsageData()
+		case <-m.ctx.Done():
+			m.saveUsageData() // keep what was counted since the last save
+			return
+		}
+	}
+}
+
+func (m *Usage) serve() {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", m.handleIndex) // handle index
+	mux.HandleFunc("/", m.handleIndex)
 	mux.HandleFunc("/stats", m.statsHandler)
 	if m.sniffer {
-		mux.HandleFunc("/data", m.handleData) // New route for JSON data
+		mux.HandleFunc("/data", m.handleData)
 	}
-	m.server = &http.Server{
-		Addr:    m.listenAddr,
-		Handler: mux,
+	server := &http.Server{
+		Addr:              m.listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// Collect system stats in the background, so requests never wait for them
 	go func() {
-		<-m.shutdownCtx.Done()
+		m.collectStats()
+
+		ticker := time.NewTicker(statsInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				m.collectStats()
+			case <-m.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		<-m.ctx.Done()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		// Attempt to gracefully shut down the server
-		if err := m.server.Shutdown(shutdownCtx); err != nil {
-			m.logger.Errorf("sniffer server shutdown error: %v", err)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			m.logger.Errorf("web panel shutdown error: %v", err)
 		}
 	}()
 
-	// start save data
-	if m.sniffer {
-		go func() {
-			ticker := time.NewTicker(15 * time.Second) // every 15 seconds
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ticker.C:
-					m.saveUsageData()
-				case <-m.shutdownCtx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	// Start the server, retrying while the port is busy (e.g. during a restart)
-	listener, ok := network.RetryListen(m.shutdownCtx, m.logger, "web interface "+m.listenAddr, func() (stdnet.Listener, error) {
+	// Retry while the port is busy (e.g. during a hot reload)
+	listener, ok := network.RetryListen(m.ctx, m.logger, "web interface "+m.listenAddr, func() (stdnet.Listener, error) {
 		return stdnet.Listen("tcp", m.listenAddr)
 	})
 	if !ok {
 		return
 	}
 
-	m.logger.Info("sniffer service listening on port: ", m.listenAddr)
-	if err := m.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		m.logger.Errorf("sniffer server error: %v", err)
+	m.logger.Info("web panel listening on: ", m.listenAddr)
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		m.logger.Errorf("web panel error: %v", err)
 	}
 }
 
@@ -172,22 +240,50 @@ func (m *Usage) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Usage) handleData(w http.ResponseWriter, r *http.Request) {
-	usageData := m.getUsageFromFile()
-	readableData := m.usageDataWithReadableUsage(usageData)
+	m.ensureTotals()
+
+	// saved totals plus whatever was counted since the last save
+	usage := map[int]uint64{}
+	m.totalsMu.RLock()
+	for port, n := range m.totals {
+		usage[port] = n
+	}
+	m.totalsMu.RUnlock()
+
+	m.pending.Range(func(key, value any) bool {
+		if n := value.(*atomic.Uint64).Load(); n > 0 {
+			usage[key.(int)] += n
+		}
+		return true
+	})
+
+	rows := make([]PortUsageView, 0, len(usage)) // encodes as [] rather than null
+	for port, n := range usage {
+		rows = append(rows, PortUsageView{Port: port, Usage: n, ReadableUsage: m.convertBytesToReadable(n)})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Port < rows[j].Port })
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(readableData); err != nil {
+	if err := json.NewEncoder(w).Encode(rows); err != nil {
 		m.logger.Errorf("error encoding JSON response: %v", err)
 	}
 }
 
 func (m *Usage) statsHandler(w http.ResponseWriter, r *http.Request) {
-	stats, err := m.getSystemStats()
-	if err != nil {
-		m.logger.Error("Error fetching system stats:", err)
+	snapshot := m.stats.Load()
+	if snapshot == nil {
+		// the collector has not run yet
+		m.collectStats()
+		snapshot = m.stats.Load()
+	}
+	if snapshot == nil {
 		http.Error(w, "failed to read system stats", http.StatusInternalServerError)
 		return
 	}
+
+	stats := *snapshot
+	stats.TunnelStatus = *m.tunnelStatus.Load()
+	stats.TunnelTraffic = m.convertBytesToReadable(m.totalTraffic.Load() + m.pendingTotal())
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(stats); err != nil {
@@ -195,161 +291,140 @@ func (m *Usage) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (m *Usage) AddOrUpdatePort(port int, usage uint64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Retrieve current usage data for the port
-	value, ok := m.dataStore.Load(port)
-	if ok {
-		// Port exists, update usage
-		portUsage := value.(PortUsage)
-		portUsage.Usage += usage
-		m.dataStore.Store(port, portUsage)
-	} else {
-		// Port does not exist, create new entry
-		m.dataStore.Store(port, PortUsage{Port: port, Usage: usage})
-	}
-}
-
-func (m *Usage) saveUsageData() {
-	// Step 1: Load existing usage data from the JSON file
-	var existingUsageData []PortUsage
-	file, err := os.Open(m.snifferLog)
-	if err == nil {
-		// If the file exists, decode the JSON data into existingUsageData
-		defer file.Close()
-		err = json.NewDecoder(file).Decode(&existingUsageData)
-		if err != nil {
-			m.logger.Errorf("error decoding JSON data: %v", err)
-			return
-		}
-	} else if !os.IsNotExist(err) {
-		// Log any error except file not existing
-		m.logger.Errorf("error opening JSON file: %v", err)
-		return
-	}
-
-	// Step 2: Get current usage data from sync.Map
-	currentUsageData := m.collectUsageDataFromSyncMap()
-
-	// Step 3: Merge the existing and current usage data into a map to avoid duplicates
-	usageMap := make(map[int]PortUsage)
-
-	// Add existing usage data to the map
-	for _, usage := range existingUsageData {
-		usageMap[usage.Port] = usage
-	}
-
-	// Append or update current usage data in the map
-	for _, usage := range currentUsageData {
-		if existing, exists := usageMap[usage.Port]; exists {
-			// Update existing port usage
-			existing.Usage += usage.Usage
-			usageMap[usage.Port] = existing
-		} else {
-			// Add new port usage
-			usageMap[usage.Port] = usage
-		}
-	}
-
-	// Step 4: Convert the map back to a slice
-	var mergedUsageData []PortUsage
-	var totalTraffic uint64
-	for _, usage := range usageMap {
-		mergedUsageData = append(mergedUsageData, usage)
-		totalTraffic += usage.Usage
-	}
-	m.totalTraffic.Store(totalTraffic)
-
-	// Step 5: Convert merged data to JSON
-	data, err := json.MarshalIndent(mergedUsageData, "", "  ")
-	if err != nil {
-		m.logger.Errorf("error marshalling usage data: %v", err)
-		return
-	}
-
-	// Step 6: Write JSON data to file
-	err = os.WriteFile(m.snifferLog, data, 0644)
-	if err != nil {
-		m.logger.Errorf("error writing usage data to file: %v", err)
-	}
-}
-
-func (m *Usage) getUsageFromFile() []PortUsage {
-	// Check if the file exists
-	if _, err := os.Stat(m.snifferLog); os.IsNotExist(err) {
-		// If the file does not exist, create it and write "null"
-		file, err := os.OpenFile(m.snifferLog, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			m.logger.Errorf("error creating file: %v", err)
-			return nil
-		}
-
-		// Write "null" to the new file
-		if _, err := file.Write([]byte("null")); err != nil {
-			m.logger.Errorf("error writing 'null' to the file: %v", err)
-			file.Close()
-			return nil
-		}
-
-		return nil
-	}
-
-	var usageData []PortUsage
-
-	// Open the JSON file
-	file, err := os.Open(m.snifferLog)
-	if err != nil {
-		m.logger.Errorf("error opening JSON file: %v", err)
-		return nil
-	}
-	defer file.Close()
-
-	// Decode the JSON file into the usageData slice
-	err = json.NewDecoder(file).Decode(&usageData)
-	if err != nil {
-		m.logger.Errorf("error decoding JSON data: %v", err)
-		return nil
-	}
-
-	// Sort usageData by Port in ascending order
-	sort.Slice(usageData, func(i, j int) bool {
-		return usageData[i].Port < usageData[j].Port
+// pendingTotal is the sum of bytes counted since the last save.
+func (m *Usage) pendingTotal() uint64 {
+	var total uint64
+	m.pending.Range(func(_, value any) bool {
+		total += value.(*atomic.Uint64).Load()
+		return true
 	})
-
-	return usageData
+	return total
 }
 
-// converts the byte usage to a human-readable format
-func (m *Usage) usageDataWithReadableUsage(usageData []PortUsage) []PortUsageView {
-	result := make([]PortUsageView, 0, len(usageData)) // encodes as [] rather than null
-
-	for _, portUsage := range usageData {
-		result = append(result, PortUsageView{
-			Port:          portUsage.Port,
-			Usage:         portUsage.Usage,
-			ReadableUsage: m.convertBytesToReadable(portUsage.Usage),
-		})
+// ensureTotals loads the saved usage from snifferLog the first time it is needed.
+func (m *Usage) ensureTotals() {
+	m.totalsMu.RLock()
+	loaded := m.totalsLoaded
+	m.totalsMu.RUnlock()
+	if loaded {
+		return
 	}
 
-	return result
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
+	usage := m.readUsageFile()
+	m.setTotals(usage)
 }
 
-// collectUsageDataFromSyncMap gathers data from sync.Map
-func (m *Usage) collectUsageDataFromSyncMap() []PortUsage {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *Usage) setTotals(usage map[int]uint64) {
+	var sum uint64
+	for _, n := range usage {
+		sum += n
+	}
 
-	var usageData []PortUsage
-	m.dataStore.Range(func(key, value interface{}) bool {
-		if portUsage, ok := value.(PortUsage); ok {
-			usageData = append(usageData, portUsage)
-			m.dataStore.Delete(key)
+	m.totalsMu.Lock()
+	m.totals = usage
+	m.totalsLoaded = true
+	m.totalsMu.Unlock()
+
+	m.totalTraffic.Store(sum)
+}
+
+// readUsageFile reads snifferLog. A missing file is empty; a corrupt one is moved aside
+// so saving can continue.
+func (m *Usage) readUsageFile() map[int]uint64 {
+	usage := map[int]uint64{}
+
+	data, err := os.ReadFile(m.snifferLog)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			m.logger.Errorf("error reading usage file: %v", err)
+		}
+		return usage
+	}
+
+	var saved []PortUsage
+	if err := json.Unmarshal(data, &saved); err != nil {
+		corrupt := m.snifferLog + ".corrupt"
+		m.logger.Errorf("usage file %s is not valid JSON (%v); moving it to %s and starting over", m.snifferLog, err, corrupt)
+		if err := os.Rename(m.snifferLog, corrupt); err != nil {
+			m.logger.Errorf("failed to move corrupt usage file: %v", err)
+		}
+		return usage
+	}
+
+	for _, u := range saved {
+		usage[u.Port] += u.Usage
+	}
+	return usage
+}
+
+// saveUsageData merges the pending counters into snifferLog. Reading the file on every
+// save keeps an old and a new instance (during a hot reload) from overwriting each other.
+func (m *Usage) saveUsageData() {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
+	usage := m.readUsageFile()
+
+	// take the pending bytes
+	deltas := map[int]uint64{}
+	m.pending.Range(func(key, value any) bool {
+		if n := value.(*atomic.Uint64).Swap(0); n > 0 {
+			deltas[key.(int)] = n
 		}
 		return true
 	})
-	return usageData
+
+	for port, n := range deltas {
+		usage[port] += n
+	}
+
+	if len(deltas) > 0 {
+		if err := m.writeUsageFile(usage); err != nil {
+			m.logger.Errorf("error writing usage data: %v", err)
+			// keep the bytes for the next attempt
+			for port, n := range deltas {
+				m.PortCounter(port).Add(n)
+				usage[port] -= n
+			}
+		}
+	}
+
+	m.setTotals(usage)
+}
+
+// writeUsageFile replaces snifferLog atomically, so a crash never leaves a half-written file.
+func (m *Usage) writeUsageFile(usage map[int]uint64) error {
+	rows := make([]PortUsage, 0, len(usage))
+	for port, n := range usage {
+		rows = append(rows, PortUsage{Port: port, Usage: n})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Port < rows[j].Port })
+
+	data, err := json.MarshalIndent(rows, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(m.snifferLog), filepath.Base(m.snifferLog)+".tmp*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), m.snifferLog)
 }
 
 // ConvertBytesToReadable converts bytes into a human-readable format (KB, MB, GB)
@@ -375,75 +450,72 @@ func (m *Usage) convertBytesToReadable(bytes uint64) string {
 	}
 }
 
-func (m *Usage) getSystemStats() (*SystemStats, error) {
+// collectStats refreshes the cached system stats. Speeds come from the interface
+// counters' change since the previous collection.
+func (m *Usage) collectStats() {
+	m.statsMu.Lock()
+	defer m.statsMu.Unlock()
 
-	// Get initial network stats
-	initialStats, err := m.getNetworkStats()
-	if err != nil {
-		return nil, err
+	now := time.Now()
+
+	netStats, err := net.IOCounters(false)
+	if err != nil || len(netStats) == 0 {
+		m.logger.Debugf("failed to read network counters: %v", err)
+		return
 	}
+	current := netStats[0]
 
-	// Wait for 1 second
-	time.Sleep(1 * time.Second)
-
-	// Get updated network stats
-	finalStats, err := m.getNetworkStats()
-	if err != nil {
-		return nil, err
+	var uploadSpeed, downloadSpeed float64
+	if m.lastNet != nil {
+		if elapsed := now.Sub(m.lastAt).Seconds(); elapsed > 0 {
+			uploadSpeed = rate(current.BytesSent, m.lastNet.BytesSent, elapsed)
+			downloadSpeed = rate(current.BytesRecv, m.lastNet.BytesRecv, elapsed)
+		}
 	}
+	m.lastNet = &current
+	m.lastAt = now
 
-	// Get CPU usage
 	cpuPercent, err := cpu.Percent(0, false)
-	if err != nil {
-		return nil, err
+	if err != nil || len(cpuPercent) == 0 {
+		m.logger.Debugf("failed to read CPU usage: %v", err)
+		return
 	}
 
-	// Get RAM usage
 	memStats, err := mem.VirtualMemory()
 	if err != nil {
-		return nil, err
+		m.logger.Debugf("failed to read memory usage: %v", err)
+		return
 	}
 
-	// Get Disk usage
 	diskStats, err := disk.Usage("/")
 	if err != nil {
-		return nil, err
+		m.logger.Debugf("failed to read disk usage: %v", err)
+		return
 	}
 
-	// Get Swap usage
 	swapStats, err := mem.SwapMemory()
 	if err != nil {
-		return nil, err
+		m.logger.Debugf("failed to read swap usage: %v", err)
+		return
 	}
 
-	// Get Network traffic
-	netStats, err := net.IOCounters(false)
-	if err != nil {
-		return nil, err
+	if m.connsAt.IsZero() || now.Sub(m.connsAt) >= connectionsInterval {
+		if connections, err := net.Connections("all"); err == nil {
+			m.conns = len(connections)
+			m.connsAt = now
+		}
 	}
-
-	// Get all active network connections (TCP, UDP, etc.)
-	connections, err := net.Connections("all")
-	if err != nil {
-		return nil, err
-	}
-
-	// Calculate upload and download speeds
-	uploadSpeed := float64(finalStats.BytesSent - initialStats.BytesSent)
-	downloadSpeed := float64(finalStats.BytesRecv - initialStats.BytesRecv)
 
 	stats := &SystemStats{
-		TunnelStatus:   *m.tunnelStatus.Load(),
 		CPUUsage:       m.formatFloat(cpuPercent[0]),
 		RAMUsage:       m.convertBytesToReadable(memStats.Used),
 		DiskUsage:      m.convertBytesToReadable(diskStats.Used),
 		SwapUsage:      m.convertBytesToReadable(swapStats.Used),
-		NetworkTraffic: m.convertBytesToReadable(netStats[0].BytesSent + netStats[0].BytesRecv),
+		NetworkTraffic: m.convertBytesToReadable(current.BytesSent + current.BytesRecv),
 		DownloadSpeed:  m.formatSpeed(downloadSpeed),
 		UploadSpeed:    m.formatSpeed(uploadSpeed),
-		TunnelTraffic:  m.convertBytesToReadable(m.totalTraffic.Load()),
 		Sniffer:        map[bool]string{true: "Running", false: "Not running"}[m.sniffer],
-		AllConnections: fmt.Sprintf("%d", len(connections)),
+		AllConnections: fmt.Sprintf("%d", m.conns),
 
 		CPUPercent:  cpuPercent[0],
 		RAMPercent:  memStats.UsedPercent,
@@ -465,7 +537,15 @@ func (m *Usage) getSystemStats() (*SystemStats, error) {
 		stats.UptimeSeconds = uptime
 	}
 
-	return stats, nil
+	m.stats.Store(stats)
+}
+
+// rate is bytes per second between two counter readings; a counter reset gives 0.
+func rate(current, previous uint64, seconds float64) float64 {
+	if current < previous {
+		return 0
+	}
+	return float64(current-previous) / seconds
 }
 
 func (m *Usage) formatSpeed(bytesPerSec float64) string {
@@ -481,15 +561,4 @@ func (m *Usage) formatSpeed(bytesPerSec float64) string {
 
 func (m *Usage) formatFloat(value float64) string {
 	return fmt.Sprintf("%.2f%%", value)
-}
-
-func (m *Usage) getNetworkStats() (*net.IOCountersStat, error) {
-	ioCounters, err := net.IOCounters(false)
-	if err != nil {
-		return nil, err
-	}
-	if len(ioCounters) == 0 {
-		return nil, fmt.Errorf("no network IO counters found")
-	}
-	return &ioCounters[0], nil
 }

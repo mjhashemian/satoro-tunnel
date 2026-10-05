@@ -87,7 +87,7 @@ func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logr
 		localChannel:   make(chan LocalTCPConn, config.ChannelSize),
 		reqNewConnChan: make(chan struct{}, config.ChannelSize),
 		wg:             &sync.WaitGroup{},
-		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
+		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), parentCtx, config.SnifferLog, config.Sniffer, logger),
 	}
 
 	return server
@@ -100,9 +100,7 @@ func (s *WsMuxTransport) spawn(f func()) {
 
 func (s *WsMuxTransport) Start() {
 	// for  webui
-	if s.config.WebPort > 0 {
-		s.spawn(s.usageMonitor.Monitor)
-	}
+	s.usageMonitor.Start(s.config.WebPort > 0)
 
 	s.usageMonitor.SetStatus(fmt.Sprintf("Disconnected (%s)", s.config.Mode))
 
@@ -151,7 +149,6 @@ func (s *WsMuxTransport) Restart() {
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
 	s.controlChannel.Store(nil)
-	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, s.logger)
 	atomic.StoreInt32(&s.streamCounter, 0)
 	atomic.StoreInt32(&s.sessionCounter, 0)
 
@@ -244,8 +241,8 @@ func (s *WsMuxTransport) tunnelListener() {
 
 	addr := s.config.BindAddr
 	upgrader := websocket.Upgrader{
-		ReadBufferSize:   16 * 1024,
-		WriteBufferSize:  16 * 1024,
+		ReadBufferSize:   32 * 1024,
+		WriteBufferSize:  32 * 1024,
 		HandshakeTimeout: 45 * time.Second,
 		CheckOrigin: func(r *http.Request) bool {
 			return true

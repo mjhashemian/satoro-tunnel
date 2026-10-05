@@ -91,9 +91,9 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 
 				mu.Unlock()
 
-				// Create a new payload channel for this connection,  Buffer up to 100,0000 packets for the connection
-				// Generally affect the upload speed
-				payloadChan := make(chan []byte, 100_000)
+				// Create a new payload channel for this connection
+				// Its size bounds how far a burst can run ahead of the tunnel
+				payloadChan := make(chan []byte, udpFlowQueueSize)
 
 				// build the UDP packet
 				newUDPConn := LocalAcceptUDPConn{

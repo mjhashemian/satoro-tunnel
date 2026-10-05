@@ -56,7 +56,7 @@ func NewUDPClient(parentCtx context.Context, config *UdpConfig, logger *logrus.L
 		cancel:       cancel,
 		logger:       logger,
 		wg:           &sync.WaitGroup{},
-		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
+		usageMonitor: web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), parentCtx, config.SnifferLog, config.Sniffer, logger),
 		controlFlow:  make(chan struct{}, 100),
 	}
 
@@ -69,9 +69,7 @@ func (c *UdpTransport) spawn(f func()) {
 }
 
 func (c *UdpTransport) Start() {
-	if c.config.WebPort > 0 {
-		c.spawn(c.usageMonitor.Monitor)
-	}
+	c.usageMonitor.Start(c.config.WebPort > 0)
 
 	c.usageMonitor.SetStatus("Disconnected (UDP)")
 
@@ -117,7 +115,6 @@ func (c *UdpTransport) Restart() {
 	// Re-initialize variables
 	c.wg = &sync.WaitGroup{}
 	c.controlChannel.Store(nil)
-	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, c.logger)
 	atomic.StoreInt32(&c.poolConnections, 0)
 	atomic.StoreInt32(&c.loadConnections, 0)
 	c.controlFlow = make(chan struct{}, 100)
@@ -381,13 +378,17 @@ func (c *UdpTransport) localDialer(usage *web.Usage, remoteAddr string, port int
 func (c *UdpTransport) udpCopy(usage *web.Usage, srcConn, dstConn *net.UDPConn, port int) {
 	buf := make([]byte, 16*1024)
 	readTimeout := 60 * time.Second
+	var deadlineSet time.Time
 
 	for {
-		// Set the read deadline to 60 seconds from now
-		err := srcConn.SetReadDeadline(time.Now().Add(readTimeout))
-		if err != nil {
-			c.logger.Errorf("failed to set read deadline: %v", err)
-			return
+		// Push the 60 second idle deadline forward at most once a second, instead of resetting
+		// the poller's timer on every packet
+		if now := time.Now(); now.Sub(deadlineSet) >= time.Second {
+			if err := srcConn.SetReadDeadline(now.Add(readTimeout)); err != nil {
+				c.logger.Errorf("failed to set read deadline: %v", err)
+				return
+			}
+			deadlineSet = now
 		}
 
 		// Read from the UDP source connection

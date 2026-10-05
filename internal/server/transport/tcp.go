@@ -68,7 +68,7 @@ func NewTCPServer(parentCtx context.Context, config *TcpConfig, logger *logrus.L
 		localChannel:   make(chan LocalTCPConn, config.ChannelSize),
 		reqNewConnChan: make(chan struct{}, config.ChannelSize),
 		wg:             &sync.WaitGroup{},
-		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
+		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), parentCtx, config.SnifferLog, config.Sniffer, logger),
 	}
 
 	return server
@@ -86,9 +86,7 @@ func (s *TcpTransport) Start() {
 func (s *TcpTransport) run() {
 	s.usageMonitor.SetStatus("Disconnected (TCP)")
 
-	if s.config.WebPort > 0 {
-		s.spawn(s.usageMonitor.Monitor)
-	}
+	s.usageMonitor.Start(s.config.WebPort > 0)
 
 	s.spawn(s.tunnelListener)
 
@@ -154,7 +152,6 @@ func (s *TcpTransport) Restart() {
 	s.tunnelChannel = make(chan net.Conn, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
-	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, s.logger)
 	s.controlChannel.Store(nil)
 	s.rtt.Store(0)
 

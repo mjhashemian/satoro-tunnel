@@ -8,6 +8,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// udpFlowQueueSize is how many packets each UDP flow can queue before new ones are dropped.
+// The queue is allocated per client address, so it is kept modest (~100 KB per flow).
+const udpFlowQueueSize = 4096
+
 type TunnelChannel struct { // for websocket
 	conn *websocket.Conn
 	ping chan struct{}

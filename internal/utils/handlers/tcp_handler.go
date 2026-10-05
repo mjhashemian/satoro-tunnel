@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 
 	"github.com/mjhashemian/satoro-tunnel/internal/web"
 	"github.com/sirupsen/logrus"
@@ -24,12 +25,18 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 		}
 	}
 
+	// Resolve the port's counter once instead of on every write
+	var counter *atomic.Uint64
+	if sniffer && usage != nil {
+		counter = usage.PortCounter(remotePort)
+	}
+
 	go func() {
 		defer close(done)
-		transferData(from, to, logger, usage, remotePort, sniffer)
+		transferData(from, to, logger, counter)
 	}()
 
-	transferData(to, from, logger, usage, remotePort, sniffer)
+	transferData(to, from, logger, counter)
 
 	select {
 	case <-ctx.Done():
@@ -40,45 +47,18 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 	}
 }
 
-// Using direct Read and Write for transferring data
-func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	buf := make([]byte, 16*1024) // 16K
-	for {
-		// Read data from the source connection
-		r, err := from.Read(buf)
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-				logger.Trace("reader stream closed or EOF received")
-			} else {
-				logger.Trace("unable to read from the connection: ", err)
-			}
-			from.Close()
-			to.Close()
-			return
-		}
+// transferData copies from one connection to the other, then closes both so the
+// opposite direction ends too.
+func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, counter *atomic.Uint64) {
+	n, err := copyConn(to, from, counter)
 
-		totalWritten := 0
-		for totalWritten < r {
-			// Write data to the destination connection
-			w, err := to.Write(buf[totalWritten:r])
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					logger.Trace("writer stream closed or EOF received")
-				} else {
-					logger.Trace("unable to write to the connection: ", err)
-				}
-				from.Close()
-				to.Close()
-				return
+	from.Close()
+	to.Close()
 
-			}
-			totalWritten += w
-		}
-
-		logger.Tracef("read data: %d bytes, written data: %d bytes", r, totalWritten)
-		if sniffer {
-			usage.AddOrUpdatePort(remotePort, uint64(totalWritten))
-		}
+	switch {
+	case err == nil, errors.Is(err, io.EOF), errors.Is(err, net.ErrClosed):
+		logger.Tracef("stream closed after %d bytes", n)
+	default:
+		logger.Tracef("stream ended after %d bytes: %v", n, err)
 	}
-
 }
