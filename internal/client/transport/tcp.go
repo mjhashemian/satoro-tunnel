@@ -9,10 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/musix/backhaul/internal/utils"
-	"github.com/musix/backhaul/internal/utils/handlers"
-	"github.com/musix/backhaul/internal/utils/network"
-	"github.com/musix/backhaul/internal/web"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils/handlers"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils/network"
+	"github.com/mjhashemian/satoro-tunnel/internal/web"
 
 	"github.com/sirupsen/logrus"
 )

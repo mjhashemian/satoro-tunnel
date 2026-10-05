@@ -1,8 +1,9 @@
 # .goreleaser.yml
 version: 2  # Specify the config version
-project_name: backhaul
+project_name: satoro-tunnel
 builds:
-  - id: backhaul
+  - id: satoro-tunnel
+    binary: satoro-tunnel
     main: ./main.go 
     goos:
       - linux
@@ -23,8 +24,8 @@ archives:
 
 release:
    github:
-    owner: Musixal
-    name: backhaul
+    owner: mjhashemian
+    name: satoro-tunnel
 checksum:
   name_template: "checksums.txt"
 changelog:

@@ -1,13 +1,13 @@
 package cmd
 
 import (
-	"github.com/musix/backhaul/config"
+	"github.com/mjhashemian/satoro-tunnel/config"
 
 	"github.com/sirupsen/logrus"
 )
 
 const ( // Default values
-	defaultToken          = "musix"
+	defaultToken          = "musix" // inherited from Backhaul; kept so default configs interoperate with it
 	defaultChannelSize    = 2048
 	defaultRetryInterval  = 3 // only for client
 	defaultConnectionPool = 8
@@ -21,7 +21,7 @@ const ( // Default values
 	defaultMaxFrameSize     = 32768   // 32KB
 	defaultMaxReceiveBuffer = 4194304 // 4MB
 	defaultMaxStreamBuffer  = 65536   // 256KB
-	defaultSnifferLog       = "backhaul.json"
+	defaultSnifferLog       = "satoro.json"
 	defaultMuxCon           = 8
 )
 

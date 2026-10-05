@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/musix/backhaul/cmd"
+	"github.com/mjhashemian/satoro-tunnel/cmd"
 )
 
 // freePort returns a currently unused TCP (and usually UDP) port on localhost.
@@ -78,7 +78,7 @@ func startUDPEcho(t *testing.T) int {
 	return conn.LocalAddr().(*net.UDPAddr).Port
 }
 
-// runner starts a backhaul instance from a TOML config and can stop it.
+// runner starts a satoro-tunnel instance from a TOML config and can stop it.
 type runner struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -241,7 +241,7 @@ func checkTCP(t *testing.T, addr string) {
 	t.Helper()
 
 	eventually(t, 20*time.Second, "tunnel ready", func() error {
-		return tcpEcho(addr, []byte("hello backhaul"))
+		return tcpEcho(addr, []byte("hello satoro"))
 	})
 
 	var wg sync.WaitGroup

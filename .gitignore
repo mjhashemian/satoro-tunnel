@@ -35,5 +35,5 @@ dist/
 # other
 *.json
 server.*
-backhaul
+satoro-tunnel
 *.log

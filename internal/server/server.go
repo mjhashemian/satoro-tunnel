@@ -6,9 +6,9 @@ import (
 	_ "net/http/pprof"
 	"time"
 
-	"github.com/musix/backhaul/config"
-	"github.com/musix/backhaul/internal/server/transport"
-	"github.com/musix/backhaul/internal/utils"
+	"github.com/mjhashemian/satoro-tunnel/config"
+	"github.com/mjhashemian/satoro-tunnel/internal/server/transport"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils"
 
 	"github.com/sirupsen/logrus"
 )

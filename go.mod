@@ -1,4 +1,4 @@
-module github.com/musix/backhaul
+module github.com/mjhashemian/satoro-tunnel
 
 go 1.23.1
 

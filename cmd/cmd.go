@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/musix/backhaul/config"
-	"github.com/musix/backhaul/internal/client"
+	"github.com/mjhashemian/satoro-tunnel/config"
+	"github.com/mjhashemian/satoro-tunnel/internal/client"
 
-	"github.com/musix/backhaul/internal/server"
-	"github.com/musix/backhaul/internal/utils"
-	"github.com/musix/backhaul/internal/utils/portmap"
+	"github.com/mjhashemian/satoro-tunnel/internal/server"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils/portmap"
 
 	"github.com/BurntSushi/toml"
 )

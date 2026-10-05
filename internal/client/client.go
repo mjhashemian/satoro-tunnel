@@ -4,11 +4,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/musix/backhaul/internal/utils"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils"
 
-	"github.com/musix/backhaul/config"
+	"github.com/mjhashemian/satoro-tunnel/config"
 
-	"github.com/musix/backhaul/internal/client/transport"
+	"github.com/mjhashemian/satoro-tunnel/internal/client/transport"
 
 	"net/http"
 	_ "net/http/pprof"

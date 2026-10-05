@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/musix/backhaul/cmd"
-	"github.com/musix/backhaul/config"
-	"github.com/musix/backhaul/internal/utils"
+	"github.com/mjhashemian/satoro-tunnel/cmd"
+	"github.com/mjhashemian/satoro-tunnel/config"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils"
 )
 
 var (

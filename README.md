@@ -1,6 +1,8 @@
-# Backhaul
+# satoro-tunnel
 
-Welcome to the **`Backhaul`** project! This project provides a high-performance reverse tunneling solution optimized for handling massive concurrent connections through NAT and firewalls. This README will guide you through setting up and configuring both server and client components, including details on different transport protocols.
+**satoro-tunnel** is a high-performance reverse tunneling solution optimized for handling massive concurrent connections through NAT and firewalls. This README will guide you through setting up and configuring both server and client components, including details on different transport protocols.
+
+> satoro-tunnel is based on [Backhaul](https://github.com/Musixal/Backhaul) by Musixal and is distributed under the same AGPL-3.0 license. It keeps Backhaul's wire protocol, so a satoro-tunnel server and a Backhaul client (or the reverse) can talk to each other with matching settings.
 
 ---
 
@@ -20,11 +22,11 @@ Welcome to the **`Backhaul`** project! This project provides a high-performance 
       - [WS Multiplexing Configuration](#ws-multiplexing-configuration)
       - [WSS Multiplexing Configuration](#wss-multiplexing-configuration)
 5. [Generating a Self-Signed TLS Certificate with OpenSSL](#generating-a-self-signed-tls-certificate-with-openssl)
-6. [Running backhaul as a service](#running-backhaul-as-a-service)
-7. [FAQ](#faq)
-8. [Benchmark](#benchmark)
-9. [License](#license)
-10. [Donation](#donation)
+6. [Running satoro-tunnel as a service](#running-satoro-tunnel-as-a-service)
+7. [Web Panel](#web-panel)
+8. [FAQ](#faq)
+9. [Benchmark](#benchmark)
+10. [License and Credits](#license-and-credits)
 
 ---
 
@@ -43,35 +45,35 @@ This project offers a robust reverse tunneling solution to overcome NAT and fire
 * **Traffic Sniffing**: Optional network traffic monitoring with logging support.
 * **Configurable Keepalive**: Adjustable keep-alive and heartbeat intervals for stable connections.
 * **TLS Encryption**: Secure connections via WSS with support for custom TLS certificates.
-* **Web Interface**: Real-time monitoring through a lightweight web interface.
-* **Hot Reload Configuration**: Supports dynamic configuration reloading without server restarts.
+* **Web Panel**: Self-contained real-time dashboard with live throughput chart, resource gauges and per-port traffic. It needs no internet access.
+* **Hot Reload Configuration**: Supports dynamic configuration reloading without server restarts. An invalid config is rejected and the running tunnel keeps working.
 
 
 ## Installation
 
-1. **Download** the latest release from the [GitHub releases page](https://github.com/musixal/backhaul/releases).
+1. **Download** the latest release from the [GitHub releases page](https://github.com/mjhashemian/satoro-tunnel/releases).
 2. **Extract** the archive (adjust the `filename` if needed):  
 
    ```bash
-   tar -xzf backhaul_linux_amd64.tar.gz
+   tar -xzf satoro-tunnel_linux_amd64.tar.gz
    ``` 
 3. **Run** the executable:  
 
    ```bash
-   ./backhaul
+   ./satoro-tunnel
    ```
 4. You can also build from source if preferred:  
 
    ```bash
-   git clone https://github.com/musixal/backhaul.git
-   cd backhaul
+   git clone https://github.com/mjhashemian/satoro-tunnel.git
+   cd satoro-tunnel
    go build
-   ./backhaul
+   ./satoro-tunnel
    ```
 
 ## Usage
 
-The main executable for this project is `backhaul`. It requires a TOML configuration file for both the server and client components.
+The main executable for this project is `satoro-tunnel`. It requires a TOML configuration file for both the server and client components.
 
 ### Configuration Options
 
@@ -98,11 +100,11 @@ To start using the solution, you'll need to configure both server and client com
     mux_streambuffer = 65536      # 256 KB. The maximum buffer size per individual stream within a connection. (optional)
     sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
     web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
-    sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
+    sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default satoro.json)
     tls_cert = "/root/server.crt" # Path to the TLS certificate file for wss/wssmux. (mandatory).
     tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux. (mandatory).
     log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
-    skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
+    skip_optz = true              # Skip optimizations performed by satoro-tunnel (default: false)
     mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
     so_rcvbuf = 4194304           # TCP/TCPMux: Socket receive buffer size (bytes); larger buffer allows higher throughput on receive side. (default: system-defined)
     so_sndbuf = 1048576           # TCP/TCPMux: Socket send buffer size (bytes); controls send queue size to manage outgoing data flow. (default: system-defined)
@@ -125,7 +127,7 @@ To start using the solution, you'll need to configure both server and client com
    To start the `server`:
 
    ```sh
-   ./backhaul -c config.toml
+   ./satoro-tunnel -c config.toml
    ```
 * **Client Configuration**
 
@@ -148,9 +150,9 @@ To start using the solution, you'll need to configure both server and client com
    mux_streambuffer = 65536      # 256 KB. The maximum buffer size per individual stream within a connection. (optional)
    sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
    web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
-   sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
+   sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default satoro.json)
    log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
-   skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
+   skip_optz = true              # Skip optimizations performed by satoro-tunnel (default: false)
    mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
    so_rcvbuf = 1048576           # TCP/TCPMux: Socket receive buffer size (bytes); larger buffer allows higher throughput on receive side. (default: system-defined)
    so_sndbuf = 4194304           # TCP/TCPMux: Socket send buffer size (bytes); controls send queue size to manage outgoing data flow. (default: system-defined)
@@ -159,7 +161,7 @@ To start using the solution, you'll need to configure both server and client com
    To start the `client`:
 
    ```sh
-   ./backhaul -c config.toml
+   ./satoro-tunnel -c config.toml
    ```
 
 ### Detailed Configuration
@@ -178,7 +180,7 @@ To start using the solution, you'll need to configure both server and client com
    channel_size = 2048
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ports = []
    ```
@@ -197,7 +199,7 @@ To start using the solution, you'll need to configure both server and client com
    retry_interval = 3
    sniffer = false
    web_port = 2060 
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
 
    ```
@@ -233,7 +235,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_streambuffer = 65536 
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ports = []
    ```
@@ -256,7 +258,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_streambuffer = 65536 
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ```
 * **Details**:
@@ -278,7 +280,7 @@ To start using the solution, you'll need to configure both server and client com
    channel_size = 2048
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ports = []
    ```
@@ -294,7 +296,7 @@ To start using the solution, you'll need to configure both server and client com
    retry_interval = 3
    sniffer = false
    web_port = 2060 
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
 
    ```
@@ -313,7 +315,7 @@ To start using the solution, you'll need to configure both server and client com
    nodelay = true 
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ports = []
    ```
@@ -334,7 +336,7 @@ To start using the solution, you'll need to configure both server and client com
    nodelay = true 
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ```
 
@@ -357,7 +359,7 @@ To start using the solution, you'll need to configure both server and client com
    tls_key = "/root/server.key"
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ports = []
    ```
@@ -378,7 +380,7 @@ To start using the solution, you'll need to configure both server and client com
    nodelay = true 
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ```
 
@@ -406,7 +408,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_streambuffer = 65536 
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ports = []
    ```
@@ -430,7 +432,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_streambuffer = 65536 
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ```
 
@@ -455,7 +457,7 @@ To start using the solution, you'll need to configure both server and client com
    tls_key = "/root/server.key"
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ports = []
    ```
@@ -479,7 +481,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_streambuffer = 65536  
    sniffer = false 
    web_port = 2060
-   sniffer_log = "/root/backhaul.json"
+   sniffer_log = "/root/satoro.json"
    log_level = "info"
    ```
 
@@ -534,20 +536,20 @@ This will generate a certificate named `server.crt`, valid for 365 days.
 * `server.csr`: The certificate signing request (used to generate the certificate).
 * `server.crt`: Your self-signed TLS certificate.
 
-## Running backhaul as a service
+## Running satoro-tunnel as a service
 
-To create a service file for your backhaul project that ensures the service restarts automatically, you can use the following template for a systemd service file. Assuming your project runs a reverse tunnel and the main executable file is located in a certain path, here's a basic example:
+To create a service file for your satoro-tunnel installation that ensures the service restarts automatically, you can use the following template for a systemd service file. Assuming your project runs a reverse tunnel and the main executable file is located in a certain path, here's a basic example:
 
-1. Create the service file `/etc/systemd/system/backhaul.service`:
+1. Create the service file `/etc/systemd/system/satoro-tunnel.service`:
 
 ```ini
 [Unit]
-Description=Backhaul Reverse Tunnel Service
+Description=Satoro Tunnel Reverse Tunnel Service
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/root/backhaul -c /root/config.toml
+ExecStart=/root/satoro-tunnel -c /root/config.toml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -559,17 +561,38 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable backhaul.service
-sudo systemctl start backhaul.service
+sudo systemctl enable satoro-tunnel.service
+sudo systemctl start satoro-tunnel.service
 ```
 3. To verify if the service is running:
 ```bash
-sudo systemctl status backhaul.service
+sudo systemctl status satoro-tunnel.service
 ```
-4. View the most recent log entries for the backhaul.service unit:
+4. View the most recent log entries for the satoro-tunnel.service unit:
 ```bash
-journalctl -u backhaul.service -e -f
+journalctl -u satoro-tunnel.service -e -f
 ```
+
+## Web Panel
+
+Set `web_port` (for example `web_port = 2060`) on the server or client and open `http://<host>:2060`. The panel is a single page embedded in the binary. It loads no CDN scripts, fonts or icons, so it works on servers without internet access.
+
+It shows:
+
+* **Tunnel status**: whether the peer is connected, and which transport is in use.
+* **Throughput**: live download/upload rate of the server's network interface, with a chart of the last few minutes. Hover the chart for exact values.
+* **Tunnel facts**: total traffic carried by the tunnel, open connections, interface totals and sniffer state.
+* **Resource gauges**: CPU, memory, disk and swap usage.
+* **Traffic by port**: bytes transferred per mapped port and each port's share, with a filter. This needs `sniffer = true`. Usage is saved to `sniffer_log` every 15 seconds.
+
+The panel follows your system's light/dark preference, and the toggle in the top-right corner remembers your choice.
+
+> The panel has no login. Bind it to a trusted network or put it behind a firewall or reverse proxy with authentication.
+
+The panel reads two JSON endpoints that you can also use from scripts:
+
+* `GET /stats`: system and tunnel stats, as formatted strings (`downloadSpeed`, `ramUsage`, …) plus raw numbers (`downloadBps`, `ramPercent`, …).
+* `GET /data`: per-port usage `[{"Port": 443, "Usage": 1048576, "ReadableUsage": "1.00 MB"}]`. Only available when the sniffer is on.
 
 ## FAQ
 
@@ -583,21 +606,12 @@ journalctl -u backhaul.service -e -f
 
 ## Benchmark
 
-For in-depth information, please visit the dedicated [Benchmark page](./benchmark/).
+For in-depth information, please visit the dedicated [Benchmark page](./benchmark/). Those measurements were taken on the upstream Backhaul project.
 
 
-## License
+## License and Credits
 
-This project is licensed under the AGPL-3.0 license. See the LICENSE file for details.
+This project is licensed under the AGPL-3.0 license. See the [LICENSE](LICENSE) file for details.
 
-## Donation
-
-Donate TRX (TRC-20) to support our project:
-``` wallet
-TMVBGzX4qpt12R1qWsJMpT1ttoKH1kus1H
-```
-Thanks for your support! 
-
-## Stargazers over time
-[![Stargazers over time](https://starchart.cc/Musixal/Backhaul.svg?variant=light)](https://starchart.cc/Musixal/Backhaul)
+satoro-tunnel is a fork of [Backhaul](https://github.com/Musixal/Backhaul), created by Musixal. The tunneling design, transports and wire protocol come from Backhaul. satoro-tunnel adds stability and concurrency fixes, a test suite, and a redesigned web panel.
 

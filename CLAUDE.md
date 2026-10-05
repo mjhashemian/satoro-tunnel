@@ -4,14 +4,18 @@ Guidance for working in this repository.
 
 ## Project
 
-Backhaul is a high-performance **reverse tunnel** written in Go (module `github.com/musix/backhaul`, Go 1.23.1, AGPL-3.0). One binary runs as either a **server** (public side, exposes ports) or a **client** (behind NAT, dials out). The role is chosen by the TOML config: `[server].bind_addr` set → server; else `[client].remote_addr` set → client.
+satoro-tunnel is a high-performance **reverse tunnel** written in Go (module `github.com/mjhashemian/satoro-tunnel`, Go 1.23.1, AGPL-3.0).
+
+It is a fork of [Backhaul](https://github.com/Musixal/Backhaul) by Musixal. Keep the attribution in README.md, the panel footer and LICENSE. **Stay wire-compatible with Backhaul:** don't change the framing, signal bytes, handshake, WS paths/headers, or the default token `"musix"` without a deliberate decision.
+
+One binary runs as either a **server** (public side, exposes ports) or a **client** (behind NAT, dials out). The role is chosen by the TOML config: `[server].bind_addr` set → server; else `[client].remote_addr` set → client.
 
 ## Commands
 
 ```bash
-go build                      # produces ./backhaul
-./backhaul -c config.toml     # run (server or client, depending on config)
-./backhaul -v                 # print version
+go build                           # produces ./satoro-tunnel
+./satoro-tunnel -c config.toml     # run (server or client, depending on config)
+./satoro-tunnel -v                 # print version
 go vet ./...
 go test -race -count=1 ./...  # unit tests + e2e (internal/e2e, linux only); -race needs gcc
 ```
@@ -85,7 +89,19 @@ Every transport follows the same model:
 `"443"`, `"443-600"`, `"443-600:5201"`, `"443-600=1.1.1.1:5201"`, `"4000=5000"`, `"127.0.0.2:443=1.1.1.1:5201"`. They are parsed only by `portmap.Parse` (table-tested in `portmap_test.go`). `cmd.Load` rejects invalid mappings at startup, and each server transport's `parsePortMappings` just loops over the result.
 
 ### Monitoring
-`web.NewDataStore(...)` is created per transport. If `web_port > 0` it serves `/` (embedded template), `/stats` (system stats via gopsutil) and `/data` (per-port usage, only when `sniffer = true`). Per-port byte counts are flushed to `sniffer_log` JSON every 15s. `pprof = true` opens :6060 (server) or :6061 (client). The web UI has no authentication.
+`web.NewDataStore(...)` is created per transport. If `web_port > 0` it serves:
+- `/`: the panel, `internal/web/index.html`, embedded as raw bytes (not a Go template)
+- `/stats`: system stats via gopsutil
+- `/data`: per-port usage; only registered when `sniffer = true`, otherwise 404
+
+Per-port byte counts are flushed to `sniffer_log` (default `satoro.json`) every 15s. `pprof = true` opens :6060 (server) or :6061 (client). The web UI has no authentication.
+
+Panel rules:
+- `index.html` must stay **fully self-contained**: no CDN scripts, web fonts or external icons, because servers often can't reach them. Inline CSS/JS and SVG only.
+- Colors are CSS tokens on `:root`, with a dark set under `prefers-color-scheme` and `[data-theme]`.
+- Insert server-provided strings with `textContent`, never `innerHTML`.
+- `/stats` keeps the formatted string fields (scripts may rely on them) plus raw numeric fields (`cpuPercent`, `downloadBps`, …) for gauges and charts. Add fields rather than renaming them.
+- Check layout at phone width (375px) as well as desktop.
 
 ## Conventions
 

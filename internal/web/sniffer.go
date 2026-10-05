@@ -2,11 +2,10 @@ package web
 
 import (
 	"context"
-	"embed"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	stdnet "net"
 	"net/http"
 	"os"
@@ -15,9 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/mjhashemian/satoro-tunnel/internal/utils/network"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/mem"
 	"github.com/shirou/gopsutil/v4/net"
 
@@ -44,17 +44,38 @@ type PortUsage struct {
 }
 
 type SystemStats struct {
-	TunnelStatus    string `json:"tunnelStatus"`
-	CPUUsage        string `json:"cpuUsage"`
-	RAMUsage        string `json:"ramUsage"`
-	DiskUsage       string `json:"diskUsage"`
-	SwapUsage       string `json:"swapUsage"`
-	NetworkTraffic  string `json:"networkTraffic"`
-	UploadSpeed     string `json:"uploadSpeed"`
-	DownloadSpeed   string `json:"downloadSpeed"`
-	BackhaulTraffic string `json:"backhaulTraffic"`
-	Sniffer         string `json:"sniffer"`
-	AllConnections  string `json:"allConnections"`
+	TunnelStatus   string `json:"tunnelStatus"`
+	CPUUsage       string `json:"cpuUsage"`
+	RAMUsage       string `json:"ramUsage"`
+	DiskUsage      string `json:"diskUsage"`
+	SwapUsage      string `json:"swapUsage"`
+	NetworkTraffic string `json:"networkTraffic"`
+	UploadSpeed    string `json:"uploadSpeed"`
+	DownloadSpeed  string `json:"downloadSpeed"`
+	TunnelTraffic  string `json:"tunnelTraffic"`
+	Sniffer        string `json:"sniffer"`
+	AllConnections string `json:"allConnections"`
+
+	// Raw values for the panel's gauges and charts
+	CPUPercent    float64 `json:"cpuPercent"`
+	RAMPercent    float64 `json:"ramPercent"`
+	RAMTotal      string  `json:"ramTotal"`
+	DiskPercent   float64 `json:"diskPercent"`
+	DiskTotal     string  `json:"diskTotal"`
+	SwapPercent   float64 `json:"swapPercent"`
+	SwapTotal     string  `json:"swapTotal"`
+	UploadBps     float64 `json:"uploadBps"`
+	DownloadBps   float64 `json:"downloadBps"`
+	SnifferOn     bool    `json:"snifferOn"`
+	Hostname      string  `json:"hostname"`
+	UptimeSeconds uint64  `json:"uptimeSeconds"`
+}
+
+// PortUsageView is one row of the /data response.
+type PortUsageView struct {
+	Port          int
+	Usage         uint64
+	ReadableUsage string
 }
 
 func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog string, sniffer bool, logger *logrus.Logger) *Usage {
@@ -131,22 +152,22 @@ func (m *Usage) Monitor() {
 	}
 }
 
+// The panel is a single self-contained page: no CDN, fonts or scripts are fetched,
+// so it also works on servers that cannot reach the internet.
+//
 //go:embed index.html
-var indexHTML embed.FS
+var indexHTML []byte
 
 func (m *Usage) handleIndex(w http.ResponseWriter, r *http.Request) {
-	usageData := m.getUsageFromFile()
-	readableData := m.usageDataWithReadableUsage(usageData)
-
-	tmpl, err := template.ParseFS(indexHTML, "index.html")
-	if err != nil {
-		m.logger.Errorf("error parsing template: %v", err)
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
 		return
 	}
 
-	err = tmpl.Execute(w, readableData)
-	if err != nil {
-		m.logger.Errorf("error executing template: %v", err)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	if _, err := w.Write(indexHTML); err != nil {
+		m.logger.Debugf("error writing index page: %v", err)
 	}
 }
 
@@ -164,6 +185,7 @@ func (m *Usage) statsHandler(w http.ResponseWriter, r *http.Request) {
 	stats, err := m.getSystemStats()
 	if err != nil {
 		m.logger.Error("Error fetching system stats:", err)
+		http.Error(w, "failed to read system stats", http.StatusInternalServerError)
 		return
 	}
 
@@ -300,21 +322,13 @@ func (m *Usage) getUsageFromFile() []PortUsage {
 }
 
 // converts the byte usage to a human-readable format
-func (m *Usage) usageDataWithReadableUsage(usageData []PortUsage) []struct {
-	Port          int
-	ReadableUsage string
-} {
-	var result []struct {
-		Port          int
-		ReadableUsage string
-	}
+func (m *Usage) usageDataWithReadableUsage(usageData []PortUsage) []PortUsageView {
+	result := make([]PortUsageView, 0, len(usageData)) // encodes as [] rather than null
 
 	for _, portUsage := range usageData {
-		result = append(result, struct {
-			Port          int
-			ReadableUsage string
-		}{
+		result = append(result, PortUsageView{
 			Port:          portUsage.Port,
+			Usage:         portUsage.Usage,
 			ReadableUsage: m.convertBytesToReadable(portUsage.Usage),
 		})
 	}
@@ -419,17 +433,36 @@ func (m *Usage) getSystemStats() (*SystemStats, error) {
 	downloadSpeed := float64(finalStats.BytesRecv - initialStats.BytesRecv)
 
 	stats := &SystemStats{
-		TunnelStatus:    *m.tunnelStatus.Load(),
-		CPUUsage:        m.formatFloat(cpuPercent[0]),
-		RAMUsage:        m.convertBytesToReadable(memStats.Used),
-		DiskUsage:       m.convertBytesToReadable(diskStats.Used),
-		SwapUsage:       m.convertBytesToReadable(swapStats.Used),
-		NetworkTraffic:  m.convertBytesToReadable(netStats[0].BytesSent + netStats[0].BytesRecv),
-		DownloadSpeed:   m.formatSpeed(downloadSpeed),
-		UploadSpeed:     m.formatSpeed(uploadSpeed),
-		BackhaulTraffic: m.convertBytesToReadable(m.totalTraffic.Load()),
-		Sniffer:         map[bool]string{true: "Running", false: "Not running"}[m.sniffer],
-		AllConnections:  fmt.Sprintf("%d", len(connections)),
+		TunnelStatus:   *m.tunnelStatus.Load(),
+		CPUUsage:       m.formatFloat(cpuPercent[0]),
+		RAMUsage:       m.convertBytesToReadable(memStats.Used),
+		DiskUsage:      m.convertBytesToReadable(diskStats.Used),
+		SwapUsage:      m.convertBytesToReadable(swapStats.Used),
+		NetworkTraffic: m.convertBytesToReadable(netStats[0].BytesSent + netStats[0].BytesRecv),
+		DownloadSpeed:  m.formatSpeed(downloadSpeed),
+		UploadSpeed:    m.formatSpeed(uploadSpeed),
+		TunnelTraffic:  m.convertBytesToReadable(m.totalTraffic.Load()),
+		Sniffer:        map[bool]string{true: "Running", false: "Not running"}[m.sniffer],
+		AllConnections: fmt.Sprintf("%d", len(connections)),
+
+		CPUPercent:  cpuPercent[0],
+		RAMPercent:  memStats.UsedPercent,
+		RAMTotal:    m.convertBytesToReadable(memStats.Total),
+		DiskPercent: diskStats.UsedPercent,
+		DiskTotal:   m.convertBytesToReadable(diskStats.Total),
+		SwapPercent: swapStats.UsedPercent,
+		SwapTotal:   m.convertBytesToReadable(swapStats.Total),
+		UploadBps:   uploadSpeed,
+		DownloadBps: downloadSpeed,
+		SnifferOn:   m.sniffer,
+	}
+
+	// Host details are informational only, so failures are ignored
+	if hostname, err := os.Hostname(); err == nil {
+		stats.Hostname = hostname
+	}
+	if uptime, err := host.Uptime(); err == nil {
+		stats.UptimeSeconds = uptime
 	}
 
 	return stats, nil
