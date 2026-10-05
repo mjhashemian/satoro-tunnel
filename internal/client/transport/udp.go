@@ -426,3 +426,8 @@ func (c *UdpTransport) udpCopy(usage *web.Usage, srcConn, dstConn *net.UDPConn, 
 		c.logger.Debugf("forwarded %d bytes from %s to %s", n, srcConn.LocalAddr().String(), dstConn.RemoteAddr().String())
 	}
 }
+
+// Done is closed once the transport's usage data has been saved after shutdown.
+func (c *UdpTransport) Done() <-chan struct{} {
+	return c.usageMonitor.Done()
+}

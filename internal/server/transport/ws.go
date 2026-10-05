@@ -517,3 +517,8 @@ func (s *WsTransport) keepAlive(conn *TunnelChannel) {
 		}
 	}
 }
+
+// Done is closed once the transport's usage data has been saved after shutdown.
+func (s *WsTransport) Done() <-chan struct{} {
+	return s.usageMonitor.Done()
+}

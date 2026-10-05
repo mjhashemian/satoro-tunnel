@@ -118,10 +118,11 @@ func (r *runner) stop() {
 type setup struct {
 	transport string
 	acceptUDP bool
-	udpTarget bool // forward to the UDP echo server instead of the TCP one
-	sniffer   bool // record per-port traffic on the server
-	webPort   int  // server web panel port, 0 = off
-	nodelay   bool // TCP_NODELAY on tunnel and local sockets (both sides)
+	udpTarget bool   // forward to the UDP echo server instead of the TCP one
+	sniffer   bool   // record per-port traffic on the server
+	usageFile string // server sniffer_log; a temp file when empty
+	webPort   int    // server web panel port, 0 = off
+	nodelay   bool   // TCP_NODELAY on tunnel and local sockets (both sides)
 }
 
 // pair builds a matching server and client config. It returns the configs and the
@@ -135,6 +136,10 @@ func pair(t testing.TB, s setup) (serverCfg, clientCfg string, localPort int) {
 	target := startTCPEcho(t)
 	if s.udpTarget {
 		target = startUDPEcho(t)
+	}
+
+	if s.usageFile == "" {
+		s.usageFile = filepath.Join(t.TempDir(), "usage.json")
 	}
 
 	serverCfg = fmt.Sprintf(`
@@ -151,7 +156,7 @@ web_port = %d
 log_level = "error"
 skip_optz = true
 ports = ["127.0.0.1:%d=127.0.0.1:%d"]
-`, tunnelPort, s.transport, s.acceptUDP, s.nodelay, s.sniffer, filepath.Join(t.TempDir(), "usage.json"), s.webPort, localPort, target)
+`, tunnelPort, s.transport, s.acceptUDP, s.nodelay, s.sniffer, s.usageFile, s.webPort, localPort, target)
 
 	clientCfg = fmt.Sprintf(`
 [client]
@@ -385,6 +390,37 @@ func getJSON(url string, v any) error {
 		return fmt.Errorf("%s: status %d", url, resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+// TestShutdownSavesUsage checks that stopping an instance returns only after the traffic
+// it counted has been written to sniffer_log.
+func TestShutdownSavesUsage(t *testing.T) {
+	usageFile := filepath.Join(t.TempDir(), "usage.json")
+	serverCfg, clientCfg, localPort := pair(t, setup{transport: "tcp", sniffer: true, usageFile: usageFile})
+
+	server := start(t, serverCfg)
+	start(t, clientCfg)
+	checkTCP(t, fmt.Sprintf("127.0.0.1:%d", localPort))
+
+	server.stop() // well before the 15s save interval
+
+	data, err := os.ReadFile(usageFile)
+	if err != nil {
+		t.Fatalf("usage file not written by shutdown: %v", err)
+	}
+	var rows []struct {
+		Port  int
+		Usage uint64
+	}
+	if err := json.Unmarshal(data, &rows); err != nil {
+		t.Fatalf("usage file is not valid JSON: %v", err)
+	}
+	for _, r := range rows {
+		if r.Port == localPort && r.Usage > 0 {
+			return
+		}
+	}
+	t.Fatalf("usage file has no traffic for port %d: %s", localPort, data)
 }
 
 // TestPanelSurvivesRestart replaces the client (so the server restarts) while polling

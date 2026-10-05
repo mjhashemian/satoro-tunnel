@@ -607,3 +607,8 @@ func (s *TcpMuxTransport) requeue(ctx context.Context, localChannel chan LocalTC
 		atomic.AddInt32(&s.streamCounter, -1)
 	}
 }
+
+// Done is closed once the transport's usage data has been saved after shutdown.
+func (s *TcpMuxTransport) Done() <-chan struct{} {
+	return s.usageMonitor.Done()
+}

@@ -335,3 +335,8 @@ func (c *WsMuxTransport) localDialer(ctx context.Context, usage *web.Usage, stre
 
 	handlers.TCPConnectionHandler(ctx, false, stream, localConnection, c.logger, usage, int(port), c.config.Sniffer)
 }
+
+// Done is closed once the transport's usage data has been saved after shutdown.
+func (c *WsMuxTransport) Done() <-chan struct{} {
+	return c.usageMonitor.Done()
+}

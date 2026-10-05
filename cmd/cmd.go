@@ -96,13 +96,10 @@ func Run(cfg *config.Config, ctx context.Context) {
 			ApplyTCPTuning()
 		}
 
-		srv := server.NewServer(&cfg.Server, ctx) // server
-		go srv.Start()
-
-		// Wait for shutdown signal
-		<-ctx.Done()
-		srv.Stop()
-		utils.NewLogger(cfg.Server.LogLevel).Info("shutting down server...")
+		// Start blocks until ctx is done and the transport has saved its usage data
+		srv := server.NewServer(&cfg.Server, ctx)
+		srv.Start()
+		utils.NewLogger(cfg.Server.LogLevel).Info("server stopped")
 		return
 	}
 
@@ -111,11 +108,8 @@ func Run(cfg *config.Config, ctx context.Context) {
 		ApplyTCPTuning()
 	}
 
-	clnt := client.NewClient(&cfg.Client, ctx) // client
-	go clnt.Start()
-
-	// Wait for shutdown signal
-	<-ctx.Done()
-	clnt.Stop()
-	utils.NewLogger(cfg.Client.LogLevel).Info("shutting down client...")
+	// Start blocks until ctx is done and the transport has saved its usage data
+	clnt := client.NewClient(&cfg.Client, ctx)
+	clnt.Start()
+	utils.NewLogger(cfg.Client.LogLevel).Info("client stopped")
 }

@@ -101,7 +101,7 @@ func main() {
 	<-sigChan
 
 	close(stopReload)
-	app.stop(3 * time.Second)
+	app.stop(5 * time.Second) // the transport may take up to 3s to save its usage data
 
 	// give background workers a moment to close their connections
 	time.Sleep(1 * time.Second)

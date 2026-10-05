@@ -41,6 +41,7 @@ type Usage struct {
 	sniffer    bool
 	snifferLog string
 	startOnce  sync.Once
+	done       chan struct{} // closed once the final save after shutdown has finished
 
 	pending sync.Map // int port -> *atomic.Uint64, bytes not yet saved
 
@@ -110,6 +111,7 @@ func NewDataStore(listenAddr string, ctx context.Context, snifferLog string, sni
 		sniffer:    sniffer,
 		snifferLog: snifferLog,
 		totals:     map[int]uint64{},
+		done:       make(chan struct{}),
 	}
 	u.SetStatus("")
 	return u
@@ -141,6 +143,8 @@ func (m *Usage) Start(web bool) {
 	m.startOnce.Do(func() {
 		if m.sniffer {
 			go m.saveLoop()
+		} else {
+			close(m.done) // nothing to save on shutdown
 		}
 		if web {
 			go m.serve()
@@ -148,7 +152,15 @@ func (m *Usage) Start(web bool) {
 	})
 }
 
+// Done is closed after the Usage has stopped and saved what it counted. Callers should
+// wait with a timeout: it never closes if Start was not called.
+func (m *Usage) Done() <-chan struct{} {
+	return m.done
+}
+
 func (m *Usage) saveLoop() {
+	defer close(m.done)
+
 	m.ensureTotals()
 
 	ticker := time.NewTicker(saveInterval)

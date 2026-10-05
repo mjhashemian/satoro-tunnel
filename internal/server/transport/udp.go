@@ -708,3 +708,8 @@ func (s *UdpTransport) keepAlive(conn *TunnelUDPConn) {
 		}
 	}
 }
+
+// Done is closed once the transport's usage data has been saved after shutdown.
+func (s *UdpTransport) Done() <-chan struct{} {
+	return s.usageMonitor.Done()
+}

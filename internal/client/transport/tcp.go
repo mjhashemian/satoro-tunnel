@@ -354,3 +354,8 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	case <-time.After(d):
 	}
 }
+
+// Done is closed once the transport's usage data has been saved after shutdown.
+func (c *TcpTransport) Done() <-chan struct{} {
+	return c.usageMonitor.Done()
+}

@@ -512,3 +512,8 @@ func (s *TcpTransport) handleLoop() {
 		}
 	}
 }
+
+// Done is closed once the transport's usage data has been saved after shutdown.
+func (s *TcpTransport) Done() <-chan struct{} {
+	return s.usageMonitor.Done()
+}

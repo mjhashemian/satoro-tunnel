@@ -39,6 +39,9 @@ func (s *Server) Start() {
 		}()
 	}
 
+	// the running transport, so shutdown can wait for its final save
+	var running interface{ Done() <-chan struct{} }
+
 	switch s.config.Transport {
 	case config.TCP:
 		tcpConfig := &transport.TcpConfig{
@@ -61,6 +64,7 @@ func (s *Server) Start() {
 
 		tcpServer := transport.NewTCPServer(s.ctx, tcpConfig, s.logger)
 		go tcpServer.Start()
+		running = tcpServer
 
 	case config.TCPMUX:
 		tcpMuxConfig := &transport.TcpMuxConfig{
@@ -87,6 +91,7 @@ func (s *Server) Start() {
 
 		tcpMuxServer := transport.NewTcpMuxServer(s.ctx, tcpMuxConfig, s.logger)
 		go tcpMuxServer.Start()
+		running = tcpMuxServer
 
 	case config.WS, config.WSS:
 		wsConfig := &transport.WsConfig{
@@ -107,6 +112,7 @@ func (s *Server) Start() {
 
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)
 		go wsServer.Start()
+		running = wsServer
 
 	case config.WSMUX, config.WSSMUX:
 		wsMuxConfig := &transport.WsMuxConfig{
@@ -133,6 +139,7 @@ func (s *Server) Start() {
 
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
 		go wsMuxServer.Start()
+		running = wsMuxServer
 
 	case config.UDP:
 		udpConfig := &transport.UdpConfig{
@@ -148,12 +155,20 @@ func (s *Server) Start() {
 
 		udpServer := transport.NewUDPServer(s.ctx, udpConfig, s.logger)
 		go udpServer.Start()
+		running = udpServer
 
 	default:
 		s.logger.Fatal("invalid transport type: ", s.config.Transport)
 	}
 
 	<-s.ctx.Done()
+
+	// Wait for the transport to save its usage data before reporting it stopped
+	select {
+	case <-running.Done():
+	case <-time.After(3 * time.Second):
+		s.logger.Warn("timed out waiting for usage data to be saved")
+	}
 
 	s.logger.Info("all workers stopped successfully")
 

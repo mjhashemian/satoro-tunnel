@@ -46,6 +46,9 @@ func (c *Client) Start() {
 
 	c.logger.Infof("client with remote address %s started successfully", c.config.RemoteAddr)
 
+	// the running transport, so shutdown can wait for its final save
+	var running interface{ Done() <-chan struct{} }
+
 	switch c.config.Transport {
 	case config.TCP:
 		tcpConfig := &transport.TcpConfig{
@@ -66,6 +69,7 @@ func (c *Client) Start() {
 		}
 		tcpClient := transport.NewTCPClient(c.ctx, tcpConfig, c.logger)
 		go tcpClient.Start()
+		running = tcpClient
 
 	case config.TCPMUX:
 		tcpMuxConfig := &transport.TcpMuxConfig{
@@ -90,6 +94,7 @@ func (c *Client) Start() {
 		}
 		tcpMuxClient := transport.NewMuxClient(c.ctx, tcpMuxConfig, c.logger)
 		go tcpMuxClient.Start()
+		running = tcpMuxClient
 
 	case config.WS, config.WSS:
 		WsConfig := &transport.WsConfig{
@@ -109,6 +114,7 @@ func (c *Client) Start() {
 		}
 		WsClient := transport.NewWSClient(c.ctx, WsConfig, c.logger)
 		go WsClient.Start()
+		running = WsClient
 
 	case config.WSMUX, config.WSSMUX:
 		wsMuxConfig := &transport.WsMuxConfig{
@@ -132,6 +138,7 @@ func (c *Client) Start() {
 		}
 		wsMuxClient := transport.NewWSMuxClient(c.ctx, wsMuxConfig, c.logger)
 		go wsMuxClient.Start()
+		running = wsMuxClient
 
 	case config.UDP:
 		udpConfig := &transport.UdpConfig{
@@ -147,12 +154,20 @@ func (c *Client) Start() {
 		}
 		udpClient := transport.NewUDPClient(c.ctx, udpConfig, c.logger)
 		go udpClient.Start()
+		running = udpClient
 
 	default:
 		c.logger.Fatal("invalid transport type: ", c.config.Transport)
 	}
 
 	<-c.ctx.Done()
+
+	// Wait for the transport to save its usage data before reporting it stopped
+	select {
+	case <-running.Done():
+	case <-time.After(3 * time.Second):
+		c.logger.Warn("timed out waiting for usage data to be saved")
+	}
 
 	c.logger.Info("all workers stopped successfully")
 
