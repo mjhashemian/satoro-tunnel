@@ -7,22 +7,64 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/musix/backhaul/cmd"
+	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/utils"
 )
 
 var (
 	logger     = utils.NewLogger("info")
 	configPath *string
-	ctx        context.Context
-	cancel     context.CancelFunc
 )
 
 // Define the version of the application
 const version = "v0.7.2"
+
+// instance is the currently running server or client.
+type instance struct {
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// start runs cfg in the background.
+func (i *instance) start(cfg *config.Config) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	i.mu.Lock()
+	i.cancel = cancel
+	i.done = done
+	i.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		cmd.Run(cfg, ctx)
+	}()
+}
+
+// stop cancels the running instance and waits for it to return, up to timeout.
+func (i *instance) stop(timeout time.Duration) {
+	i.mu.Lock()
+	cancel, done := i.cancel, i.done
+	i.mu.Unlock()
+
+	if cancel == nil {
+		return
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		logger.Warn("timed out waiting for the running instance to stop")
+	}
+}
 
 func main() {
 	configPath = flag.String("c", "", "path to the configuration file (TOML format)")
@@ -41,24 +83,31 @@ func main() {
 		logger.Fatalf("Usage: %s -c /path/to/config.toml", flag.CommandLine.Name())
 	}
 
-	// Create a context for graceful shutdown handling
-	ctx, cancel = context.WithCancel(context.Background())
+	cfg, err := cmd.Load(*configPath)
+	if err != nil {
+		logger.Fatalf("failed to load configuration: %v", err)
+	}
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	go cmd.Run(*configPath, ctx)
-	go hotReload()
+	app := &instance{}
+	app.start(cfg)
+
+	stopReload := make(chan struct{})
+	go hotReload(app, stopReload)
 
 	<-sigChan
 
-	cancel()
+	close(stopReload)
+	app.stop(3 * time.Second)
 
+	// give background workers a moment to close their connections
 	time.Sleep(1 * time.Second)
 }
 
-func hotReload() {
+func hotReload(app *instance, stop <-chan struct{}) {
 	// Get initial modification time of the config file
 	lastModTime, err := getLastModTime(*configPath)
 	if err != nil {
@@ -70,7 +119,7 @@ func hotReload() {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-stop:
 			return
 		case <-ticker.C:
 			modTime, err := getLastModTime(*configPath)
@@ -81,21 +130,20 @@ func hotReload() {
 
 			// If the modification time has changed, reload the app
 			if modTime.After(lastModTime) {
+				lastModTime = modTime
+
+				// Validate the new configuration before touching the running instance
+				cfg, err := cmd.Load(*configPath)
+				if err != nil {
+					logger.Errorf("config file changed but is invalid, keeping the current instance: %v", err)
+					continue
+				}
+
 				logger.Info("Config file changed, reloading application")
 
-				// Cancel the previous context to stop the old running instance
-				cancel()
-
-				time.Sleep(2 * time.Second)
-
-				// Create a new context for the new instance
-				newCtx, newCancel := context.WithCancel(context.Background())
-				go cmd.Run(*configPath, newCtx)
-
-				// Update the last modification time and the context
-				lastModTime = modTime
-				ctx = newCtx
-				cancel = newCancel
+				// Stop the old running instance, then start the new one
+				app.stop(5 * time.Second)
+				app.start(cfg)
 			}
 		}
 	}

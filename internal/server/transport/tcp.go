@@ -2,17 +2,18 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/portmap"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -27,17 +28,17 @@ type TcpTransport struct {
 	tunnelChannel  chan net.Conn
 	localChannel   chan LocalTCPConn
 	reqNewConnChan chan struct{}
-	controlChannel net.Conn
+	controlChannel utils.Locked[net.Conn]
 	restartMutex   sync.Mutex
+	wg             *sync.WaitGroup // control-plane goroutines of the current run
 	usageMonitor   *web.Usage
-	rtt            int64 // in ms, for UDP
+	rtt            atomic.Int64 // in ms, for UDP
 }
 
 type TcpConfig struct {
 	BindAddr      string
 	Token         string
 	SnifferLog    string
-	TunnelStatus  string
 	Ports         []string
 	Nodelay       bool
 	Sniffer       bool
@@ -66,43 +67,52 @@ func NewTCPServer(parentCtx context.Context, config *TcpConfig, logger *logrus.L
 		tunnelChannel:  make(chan net.Conn, config.ChannelSize),
 		localChannel:   make(chan LocalTCPConn, config.ChannelSize),
 		reqNewConnChan: make(chan struct{}, config.ChannelSize),
-		controlChannel: nil, // will be set when a control connection is established
-		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
-		rtt:            0,
+		wg:             &sync.WaitGroup{},
+		usageMonitor:   web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
 	}
 
 	return server
 }
 
+// spawn starts a control-plane goroutine that Restart waits for.
+func (s *TcpTransport) spawn(f func()) {
+	utils.Go(s.wg, f)
+}
+
 func (s *TcpTransport) Start() {
-	s.config.TunnelStatus = "Disconnected (TCP)"
+	s.spawn(s.run)
+}
+
+func (s *TcpTransport) run() {
+	s.usageMonitor.SetStatus("Disconnected (TCP)")
 
 	if s.config.WebPort > 0 {
-		go s.usageMonitor.Monitor()
+		s.spawn(s.usageMonitor.Monitor)
 	}
 
-	go s.tunnelListener()
+	s.spawn(s.tunnelListener)
 
 	s.channelHandshake()
 
-	if s.controlChannel != nil {
-		s.config.TunnelStatus = "Connected (TCP)"
+	if s.controlChannel.Load() != nil {
+		s.usageMonitor.SetStatus("Connected (TCP)")
 
 		numCPU := runtime.NumCPU()
 		if numCPU > 4 {
 			numCPU = 4 // Max allowed handler is 4
 		}
 
-		go s.parsePortMappings()
-		go s.channelHandler()
+		s.spawn(s.parsePortMappings)
+		s.spawn(s.channelHandler)
 
 		s.logger.Infof("starting %d handle loops on each CPU thread", numCPU)
 
 		for i := 0; i < numCPU; i++ {
-			go s.handleLoop()
+			s.spawn(s.handleLoop)
 		}
 	}
 }
+
 func (s *TcpTransport) Restart() {
 	if !s.restartMutex.TryLock() {
 		s.logger.Warn("server restart already in progress, skipping restart attempt")
@@ -121,28 +131,34 @@ func (s *TcpTransport) Restart() {
 	}
 
 	// Close open connection
-	if s.controlChannel != nil {
-		s.controlChannel.Close()
+	if cc := s.controlChannel.Load(); cc != nil {
+		cc.Close()
 	}
 
-	time.Sleep(2 * time.Second)
+	// Wait for the previous run to stop before replacing its state
+	stopped := utils.WaitTimeout(s.wg, 10*time.Second)
+
+	// set the log level again
+	s.logger.SetLevel(level)
+
+	if !stopped {
+		s.logger.Warn("timed out waiting for previous workers to stop, restarting anyway")
+	}
 
 	ctx, cancel := context.WithCancel(s.parentctx)
 	s.ctx = ctx
 	s.cancel = cancel
 
 	// Re-initialize variables
+	s.wg = &sync.WaitGroup{}
 	s.tunnelChannel = make(chan net.Conn, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
-	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.config.TunnelStatus = ""
-	s.controlChannel = nil
+	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, s.logger)
+	s.controlChannel.Store(nil)
+	s.rtt.Store(0)
 
-	// set the log level again
-	s.logger.SetLevel(level)
-
-	go s.Start()
+	s.Start()
 }
 
 func (s *TcpTransport) channelHandshake() {
@@ -159,17 +175,17 @@ func (s *TcpTransport) channelHandshake() {
 			}
 
 			msg, transport, err := utils.ReceiveBinaryTransportString(conn)
-			if transport != utils.SG_Chan {
-				s.logger.Errorf("invalid signal received for channel, Discarding connection")
-				conn.Close()
-				continue
-			} else if err != nil {
+			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					s.logger.Warn("timeout while waiting for control channel signal")
 				} else {
 					s.logger.Errorf("failed to receive control channel signal: %v", err)
 				}
 				conn.Close() // Close connection on error or timeout
+				continue
+			} else if transport != utils.SG_Chan {
+				s.logger.Errorf("invalid signal received for channel, Discarding connection")
+				conn.Close()
 				continue
 			}
 
@@ -189,7 +205,7 @@ func (s *TcpTransport) channelHandshake() {
 				continue
 			}
 
-			s.controlChannel = conn
+			s.controlChannel.Store(conn)
 
 			s.logger.Info("control channel successfully established.")
 			return
@@ -198,34 +214,38 @@ func (s *TcpTransport) channelHandshake() {
 }
 
 func (s *TcpTransport) channelHandler() {
+	ctx := s.ctx
+	controlChannel := s.controlChannel.Load()
+
 	ticker := time.NewTicker(s.config.Heartbeat)
 	defer ticker.Stop()
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 1)
 
-	go func() {
+	s.spawn(func() {
 		for {
-			select {
-			case <-s.ctx.Done():
-				return
-			default:
-				message, err := utils.ReceiveBinaryByte(s.controlChannel)
-				if err != nil {
-					if s.cancel != nil {
-						s.logger.Error("failed to read from channel connection. ", err)
-						go s.Restart()
-					}
-					return
+			message, err := utils.ReceiveBinaryByte(controlChannel)
+			if err != nil {
+				// A cancelled context means a restart or shutdown is already in progress
+				if ctx.Err() == nil {
+					s.logger.Error("failed to read from channel connection. ", err)
+					go s.Restart()
 				}
-				messageChan <- message
+				return
+			}
+
+			select {
+			case messageChan <- message:
+			case <-ctx.Done():
+				return
 			}
 		}
-	}()
+	})
 
 	// RTT measurment
 	rtt := time.Now()
-	err := utils.SendBinaryByte(s.controlChannel, utils.SG_RTT)
+	err := utils.SendBinaryByte(controlChannel, utils.SG_RTT)
 	if err != nil {
 		s.logger.Error("failed to send RTT signal, attempting to restart server...")
 		go s.Restart()
@@ -234,12 +254,12 @@ func (s *TcpTransport) channelHandler() {
 
 	for {
 		select {
-		case <-s.ctx.Done():
-			_ = utils.SendBinaryByte(s.controlChannel, utils.SG_Closed)
+		case <-ctx.Done():
+			_ = utils.SendBinaryByte(controlChannel, utils.SG_Closed)
 			return
 
 		case <-s.reqNewConnChan:
-			err := utils.SendBinaryByte(s.controlChannel, utils.SG_Chan)
+			err := utils.SendBinaryByte(controlChannel, utils.SG_Chan)
 			if err != nil {
 				s.logger.Error("failed to send request new connection signal. ", err)
 				go s.Restart()
@@ -247,7 +267,7 @@ func (s *TcpTransport) channelHandler() {
 			}
 
 		case <-ticker.C:
-			err := utils.SendBinaryByte(s.controlChannel, utils.SG_HB)
+			err := utils.SendBinaryByte(controlChannel, utils.SG_HB)
 			if err != nil {
 				s.logger.Error("failed to send heartbeat signal")
 				go s.Restart()
@@ -255,12 +275,7 @@ func (s *TcpTransport) channelHandler() {
 			}
 			s.logger.Trace("heartbeat signal sent successfully")
 
-		case message, ok := <-messageChan:
-			if !ok {
-				s.logger.Error("channel closed, likely due to an error in TCP read")
-				return
-			}
-
+		case message := <-messageChan:
 			if message == utils.SG_Closed {
 				s.logger.Warn("control channel has been closed by the client")
 				go s.Restart()
@@ -268,25 +283,26 @@ func (s *TcpTransport) channelHandler() {
 
 			} else if message == utils.SG_RTT {
 				measureRTT := time.Since(rtt)
-				s.rtt = measureRTT.Milliseconds()
-				s.logger.Infof("Round Trip Time (RTT): %d ms", s.rtt)
+				s.rtt.Store(measureRTT.Milliseconds())
+				s.logger.Infof("Round Trip Time (RTT): %d ms", measureRTT.Milliseconds())
 			}
 		}
 	}
 }
 
 func (s *TcpTransport) tunnelListener() {
-	listener, err := network.ListenWithBuffers(
-		"tcp",
-		s.config.BindAddr,
-		s.config.SO_RCVBUF,
-		s.config.SO_SNDBUF,
-		s.config.MSS,
-		s.config.KeepAlive,
-		!s.config.Nodelay,
-	)
-	if err != nil {
-		s.logger.Fatalf("failed to start listener on %s: %v", s.config.BindAddr, err)
+	listener, ok := network.RetryListen(s.ctx, s.logger, s.config.BindAddr, func() (net.Listener, error) {
+		return network.ListenWithBuffers(
+			"tcp",
+			s.config.BindAddr,
+			s.config.SO_RCVBUF,
+			s.config.SO_SNDBUF,
+			s.config.MSS,
+			s.config.KeepAlive,
+			!s.config.Nodelay,
+		)
+	})
+	if !ok {
 		return
 	}
 
@@ -294,7 +310,7 @@ func (s *TcpTransport) tunnelListener() {
 
 	s.logger.Infof("server started successfully, listening on address: %s", listener.Addr().String())
 
-	go s.acceptTunnelConn(listener)
+	s.spawn(func() { s.acceptTunnelConn(listener) })
 
 	<-s.ctx.Done()
 }
@@ -308,6 +324,9 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 			s.logger.Debugf("waiting for accept incoming tunnel connection on %s", listener.Addr().String())
 			conn, err := listener.Accept()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				s.logger.Debugf("failed to accept tunnel connection on %s: %v", listener.Addr().String(), err)
 				continue
 			}
@@ -321,8 +340,8 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 			}
 
 			// Drop all suspicious packets from other address rather than server
-			if s.controlChannel != nil && s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String() != tcpConn.RemoteAddr().(*net.TCPAddr).IP.String() {
-				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", tcpConn.RemoteAddr().(*net.TCPAddr).IP.String(), s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String())
+			if cc := s.controlChannel.Load(); cc != nil && cc.RemoteAddr().(*net.TCPAddr).IP.String() != tcpConn.RemoteAddr().(*net.TCPAddr).IP.String() {
+				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", tcpConn.RemoteAddr().(*net.TCPAddr).IP.String(), cc.RemoteAddr().(*net.TCPAddr).IP.String())
 				tcpConn.Close()
 				continue
 			}
@@ -357,112 +376,42 @@ func (s *TcpTransport) acceptTunnelConn(listener net.Listener) {
 }
 
 func (s *TcpTransport) parsePortMappings() {
-	for _, portMapping := range s.config.Ports {
-		parts := strings.Split(portMapping, "=")
+	mappings, err := portmap.Parse(s.config.Ports)
+	if err != nil {
+		// The configuration is validated at startup, so this should not happen
+		s.logger.Errorf("failed to parse port mappings: %v", err)
+		return
+	}
 
-		var localAddr, remoteAddr string
-
-		// Check if only a single port or a port range is provided (no "=" present)
-		if len(parts) == 1 {
-			localPortOrRange := strings.TrimSpace(parts[0])
-			remoteAddr = localPortOrRange // If no remote addr is provided, use the local port as the remote port
-
-			// Check if it's a port range
-			if strings.Contains(localPortOrRange, "-") {
-				rangeParts := strings.Split(localPortOrRange, "-")
-				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
-				}
-
-				// Parse and validate start and end ports
-				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
-				}
-
-				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
-				}
-
-				// Create listeners for all ports in the range
-				for port := startPort; port <= endPort; port++ {
-					localAddr = fmt.Sprintf(":%d", port)
-					go s.startListeners(localAddr, strconv.Itoa(port)) // Use port as the remoteAddr
-					time.Sleep(1 * time.Millisecond)                   // for wide port ranges
-				}
-				continue
-			} else {
-				// Handle single port case
-				port, err := strconv.Atoi(localPortOrRange)
-				if err != nil || port < 1 || port > 65535 {
-					s.logger.Fatalf("invalid port format: %s", localPortOrRange)
-				}
-				localAddr = fmt.Sprintf(":%d", port)
-			}
-		} else if len(parts) == 2 {
-			// Handle "local=remote" format
-			localPortOrRange := strings.TrimSpace(parts[0])
-			remoteAddr = strings.TrimSpace(parts[1])
-
-			// Check if local port is a range
-			if strings.Contains(localPortOrRange, "-") {
-				rangeParts := strings.Split(localPortOrRange, "-")
-				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
-				}
-
-				// Parse and validate start and end ports
-				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
-				}
-
-				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
-				}
-
-				// Create listeners for all ports in the range
-				for port := startPort; port <= endPort; port++ {
-					localAddr = fmt.Sprintf(":%d", port)
-					go s.startListeners(localAddr, remoteAddr)
-					time.Sleep(1 * time.Millisecond) // for wide port ranges
-				}
-				continue
-			} else {
-				// Handle single local port case
-				port, err := strconv.Atoi(localPortOrRange)
-				if err == nil && port > 1 && port < 65535 { // format port=remoteAddress
-					localAddr = fmt.Sprintf(":%d", port)
-				} else {
-					localAddr = localPortOrRange // format ip:port=remoteAddress
-				}
-			}
-		} else {
-			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
+	for _, m := range mappings {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
 		}
-		// Start listeners for single port
-		go s.startListeners(localAddr, remoteAddr)
+
+		s.startListeners(m.LocalAddr, m.RemoteAddr)
+		time.Sleep(1 * time.Millisecond) // for wide port ranges
 	}
 }
 
 func (s *TcpTransport) startListeners(localAddr, remoteAddr string) {
 	// Start TCP listener
-	go s.localListener(localAddr, remoteAddr)
+	s.spawn(func() { s.localListener(localAddr, remoteAddr) })
 
 	// Start UDP listener if configured
 	if s.config.AcceptUDP {
-		go s.udpListener(localAddr, remoteAddr)
+		s.spawn(func() { s.udpListener(localAddr, remoteAddr) })
 	}
 
 	s.logger.Debugf("Started listening on %s, forwarding to %s", localAddr, remoteAddr)
 }
 
 func (s *TcpTransport) localListener(localAddr string, remoteAddr string) {
-	listener, err := net.Listen("tcp", localAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to listen on %s: %v", localAddr, err)
+	listener, ok := network.RetryListen(s.ctx, s.logger, localAddr, func() (net.Listener, error) {
+		return net.Listen("tcp", localAddr)
+	})
+	if !ok {
 		return
 	}
 
@@ -470,7 +419,7 @@ func (s *TcpTransport) localListener(localAddr string, remoteAddr string) {
 
 	s.logger.Infof("listener started successfully, listening on address: %s", listener.Addr().String())
 
-	go s.acceptLocalConn(listener, remoteAddr)
+	s.spawn(func() { s.acceptLocalConn(listener, remoteAddr) })
 
 	<-s.ctx.Done()
 }
@@ -485,6 +434,9 @@ func (s *TcpTransport) acceptLocalConn(listener net.Listener, remoteAddr string)
 			s.logger.Debugf("waiting for accept incoming connection on %s", listener.Addr().String())
 			conn, err := listener.Accept()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				s.logger.Debugf("failed to accept connection on %s: %v", listener.Addr().String(), err)
 				continue
 			}
@@ -543,6 +495,7 @@ func (s *TcpTransport) handleLoop() {
 
 				select {
 				case <-s.ctx.Done():
+					localConn.conn.Close()
 					return
 
 				case tunnelConn := <-s.tunnelChannel:

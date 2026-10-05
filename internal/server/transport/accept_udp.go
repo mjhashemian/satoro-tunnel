@@ -2,12 +2,14 @@ package transport
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 	"github.com/sirupsen/logrus"
 )
@@ -15,14 +17,15 @@ import (
 const BufferSize = 16 * 1024
 
 func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
-	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to resolve local address: %v", err)
-	}
-
-	listener, err := net.ListenUDP("udp", localUDPAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to listen on local UDP port: %v", err)
+	listener, ok := network.RetryListen(s.ctx, s.logger, "udp "+localAddr, func() (*net.UDPConn, error) {
+		localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
+		if err != nil {
+			return nil, err
+		}
+		return net.ListenUDP("udp", localUDPAddr)
+	})
+	if !ok {
+		return
 	}
 
 	defer listener.Close()
@@ -42,9 +45,9 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 	mu := &sync.Mutex{}
 
 	// handle channel
-	go s.handleUDPLoop(udpChan, &activeConnections, mu)
+	s.spawn(func() { s.handleUDPLoop(udpChan, &activeConnections, mu) })
 
-	go func() {
+	s.spawn(func() {
 		for {
 			select {
 			case <-s.ctx.Done():
@@ -52,6 +55,9 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 			default:
 				n, addr, err := listener.ReadFromUDP(buf)
 				if err != nil {
+					if errors.Is(err, net.ErrClosed) {
+						return
+					}
 					s.logger.Errorf("failed to read from UDP listener: %v", err)
 					continue
 				}
@@ -62,10 +68,10 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 				mu.Lock()
 				// Check if the connection is already active
 				if existingConn, exists := activeConnections[key]; exists {
-					if existingConn.IsCongested {
+					if existingConn.IsCongested.Load() {
 						s.logger.Debugf("connection with timestamp %d congested. Removing %s from active connections due to network congestion", existingConn.timeCreated, addr.String())
 						// For congested connections, closing the payload channel immediately can cause abrupt TCP disconnection,
-						// potentially leading to data loss. Instead, allow the connection to keep transferring data for 30 more
+						// potentially leading to data loss. Instead, allow the connection to keep transferring data for 60 more
 						// seconds (or until the payload channel becomes idle). The timer will close the TCP connection once it
 						// times out. Further testing is needed to confirm this strategy's effect on overall performance and congestion handling.
 
@@ -96,7 +102,6 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 					remoteAddr:  remoteAddr,
 					listener:    listener,
 					clientAddr:  addr,
-					IsCongested: false,
 				}
 
 				mu.Lock()
@@ -117,10 +122,13 @@ func (s *TcpTransport) udpListener(localAddr string, remoteAddr string) {
 
 				default:
 					s.logger.Warn("UDP channel is full, dropping packet.")
+					mu.Lock()
+					delete(activeConnections, key)
+					mu.Unlock()
 				}
 			}
 		}
-	}()
+	})
 
 	<-s.ctx.Done()
 }
@@ -146,7 +154,7 @@ func (s *TcpTransport) handleUDPLoop(udpChan chan *LocalAcceptUDPConn, activeCon
 					}
 
 					// Handle data exchange between connections
-					go UDPConnectionHandler(localConn, tunnelConn, s.logger, s.usageMonitor, localConn.listener.LocalAddr().(*net.UDPAddr).Port, s.config.Sniffer, s.rtt, activeConnections, mu)
+					go UDPConnectionHandler(localConn, tunnelConn, s.logger, s.usageMonitor, localConn.listener.LocalAddr().(*net.UDPAddr).Port, s.config.Sniffer, s.rtt.Load(), activeConnections, mu)
 
 					s.logger.Debugf("initiate new handler for connection %s with timestamp %d", localConn.clientAddr.String(), localConn.timeCreated)
 					break loop
@@ -166,34 +174,43 @@ func UDPConnectionHandler(udp *LocalAcceptUDPConn, tcp net.Conn, logger *logrus.
 		rtt = 100
 	}
 
+	// stop tells udpToTCP to exit once the TCP side is gone
+	stop := make(chan struct{})
+
 	go func() {
-		udpToTCP(tcp, udp, logger, usage, remotePort, sniffer)
+		udpToTCP(tcp, udp, stop, logger, usage, remotePort, sniffer)
 		tcp.Close()
-		done <- struct{}{}
+		close(done)
 	}()
 
 	tcpToUDP(tcp, udp, logger, usage, remotePort, sniffer, rtt)
 	tcp.Close()
+	close(stop)
 
 	<-done
 
 	mu.Lock()
 	close(udp.payload)
 
-	if !udp.IsCongested {
+	if !udp.IsCongested.Load() {
 		delete(*activeConnections, udp.clientAddr.String())
 	}
 	mu.Unlock()
 }
 
-func udpToTCP(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+func udpToTCP(tcp net.Conn, udp *LocalAcceptUDPConn, stop <-chan struct{}, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
 	// Create a header (2 bytes) to hold the size of the data
 	header := make([]byte, 2)
 
 	inactivityTimeout := 60 * time.Second // Define a 60-second inactivity timeout
+	timer := time.NewTimer(inactivityTimeout)
+	defer timer.Stop()
 
 	for {
 		select {
+		case <-stop: // TCP side closed
+			return
+
 		case data, ok := <-udp.payload: // Wait for data on the UDP payload channel
 			if !ok {
 				return
@@ -228,7 +245,12 @@ func udpToTCP(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usag
 				usage.AddOrUpdatePort(remotePort, uint64(totalWritten))
 			}
 
-		case <-time.After(inactivityTimeout): // Timeout after 30 seconds of inactivity
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(inactivityTimeout)
+
+		case <-timer.C: // Timeout after 60 seconds of inactivity
 			logger.Debugf("connection with timestamp %d and address %s idle for 60 seconds, closing", udp.timeCreated, udp.clientAddr.String())
 			return
 		}
@@ -263,7 +285,7 @@ func tcpToUDP(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usag
 
 		// If the packet age exceeds the threshold (3x RTT), flag the connection as congested
 		if packetAge > 3*rtt {
-			udp.IsCongested = true
+			udp.IsCongested.Store(true)
 		}
 
 		// Read the 2-byte packet length header from the TCP connection

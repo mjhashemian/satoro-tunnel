@@ -2,11 +2,10 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/portmap"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -31,16 +31,16 @@ type TcpMuxTransport struct {
 	handshakeChannel chan net.Conn
 	localChannel     chan LocalTCPConn
 	reqNewConnChan   chan struct{}
-	controlChannel   net.Conn
+	controlChannel   utils.Locked[net.Conn]
 	usageMonitor     *web.Usage
 	restartMutex     sync.Mutex
+	wg               *sync.WaitGroup // control-plane goroutines of the current run
 	streamCounter    int32
 	sessionCounter   int32
 }
 
 type TcpMuxConfig struct {
 	BindAddr         string
-	TunnelStatus     string
 	SnifferLog       string
 	Token            string
 	Ports            []string
@@ -84,40 +84,47 @@ func NewTcpMuxServer(parentCtx context.Context, config *TcpMuxConfig, logger *lo
 		handshakeChannel: make(chan net.Conn),
 		localChannel:     make(chan LocalTCPConn, config.ChannelSize),
 		reqNewConnChan:   make(chan struct{}, config.ChannelSize),
-		controlChannel:   nil, // will be set when a control connection is established
-		streamCounter:    0,
-		sessionCounter:   0,
-		usageMonitor:     web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
+		wg:               &sync.WaitGroup{},
+		usageMonitor:     web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, logger),
 	}
 
 	return server
 }
 
-func (s *TcpMuxTransport) Start() {
-	if s.config.WebPort > 0 {
-		go s.usageMonitor.Monitor()
-	}
-	s.config.TunnelStatus = "Disconnected (TCPMux)"
+// spawn starts a control-plane goroutine that Restart waits for.
+func (s *TcpMuxTransport) spawn(f func()) {
+	utils.Go(s.wg, f)
+}
 
-	go s.tunnelListener()
+func (s *TcpMuxTransport) Start() {
+	s.spawn(s.run)
+}
+
+func (s *TcpMuxTransport) run() {
+	if s.config.WebPort > 0 {
+		s.spawn(s.usageMonitor.Monitor)
+	}
+	s.usageMonitor.SetStatus("Disconnected (TCPMux)")
+
+	s.spawn(s.tunnelListener)
 
 	s.channelHandshake()
 
-	if s.controlChannel != nil {
-		s.config.TunnelStatus = "Connected (TCPMux)"
+	if s.controlChannel.Load() != nil {
+		s.usageMonitor.SetStatus("Connected (TCPMux)")
 
 		numCPU := runtime.NumCPU()
 		if numCPU > 4 {
 			numCPU = 4 // Max allowed handler is 4
 		}
 
-		go s.parsePortMappings()
-		go s.channelHandler()
+		s.spawn(s.parsePortMappings)
+		s.spawn(s.channelHandler)
 
 		s.logger.Infof("starting %d handle loops on each CPU thread", numCPU)
 
 		for i := 0; i < numCPU; i++ {
-			go s.handleLoop()
+			s.spawn(s.handleLoop)
 		}
 
 	}
@@ -131,40 +138,46 @@ func (s *TcpMuxTransport) Restart() {
 	defer s.restartMutex.Unlock()
 
 	s.logger.Info("restarting server...")
-	if s.cancel != nil {
-		s.cancel()
-	}
 
 	// for removing timeout logs
 	level := s.logger.Level
 	s.logger.SetLevel(logrus.FatalLevel)
 
-	// Close any open connections in the tunnel channel.
-	if s.controlChannel != nil {
-		s.controlChannel.Close()
+	if s.cancel != nil {
+		s.cancel()
 	}
 
-	time.Sleep(2 * time.Second)
+	// Close the control channel connection.
+	if cc := s.controlChannel.Load(); cc != nil {
+		cc.Close()
+	}
+
+	// Wait for the previous run to stop before replacing its state
+	stopped := utils.WaitTimeout(s.wg, 10*time.Second)
+
+	// set the log level again
+	s.logger.SetLevel(level)
+
+	if !stopped {
+		s.logger.Warn("timed out waiting for previous workers to stop, restarting anyway")
+	}
 
 	ctx, cancel := context.WithCancel(s.parentctx)
 	s.ctx = ctx
 	s.cancel = cancel
 
 	// Re-initialize variables
+	s.wg = &sync.WaitGroup{}
 	s.tunnelChannel = make(chan *smux.Session, s.config.ChannelSize)
 	s.localChannel = make(chan LocalTCPConn, s.config.ChannelSize)
 	s.reqNewConnChan = make(chan struct{}, s.config.ChannelSize)
 	s.handshakeChannel = make(chan net.Conn)
-	s.controlChannel = nil
-	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, &s.config.TunnelStatus, s.logger)
-	s.config.TunnelStatus = ""
-	s.streamCounter = 0
-	s.sessionCounter = 0
+	s.controlChannel.Store(nil)
+	s.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", s.config.WebPort), ctx, s.config.SnifferLog, s.config.Sniffer, s.logger)
+	atomic.StoreInt32(&s.streamCounter, 0)
+	atomic.StoreInt32(&s.sessionCounter, 0)
 
-	// set the log level again
-	s.logger.SetLevel(level)
-
-	go s.Start()
+	s.Start()
 }
 
 func (s *TcpMuxTransport) channelHandshake() {
@@ -180,17 +193,17 @@ func (s *TcpMuxTransport) channelHandshake() {
 				continue
 			}
 			msg, transport, err := utils.ReceiveBinaryTransportString(conn)
-			if transport != utils.SG_Chan {
-				s.logger.Errorf("invalid signal received for channel, Discarding connection")
-				conn.Close()
-				continue
-			} else if err != nil {
+			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					s.logger.Warn("timeout while waiting for control channel signal")
 				} else {
 					s.logger.Errorf("failed to receive control channel signal: %v", err)
 				}
 				conn.Close() // Close connection on error or timeout
+				continue
+			} else if transport != utils.SG_Chan {
+				s.logger.Errorf("invalid signal received for channel, Discarding connection")
+				conn.Close()
 				continue
 			}
 
@@ -220,7 +233,7 @@ func (s *TcpMuxTransport) channelHandshake() {
 				s.logger.Warnf("failed to set TCP_NODELAY for Control Channel %s: %v", tcpConn.RemoteAddr().String(), err)
 			}
 
-			s.controlChannel = conn
+			s.controlChannel.Store(conn)
 
 			s.logger.Info("control channel successfully established.")
 
@@ -230,32 +243,40 @@ func (s *TcpMuxTransport) channelHandshake() {
 }
 
 func (s *TcpMuxTransport) channelHandler() {
+	ctx := s.ctx
+	controlChannel := s.controlChannel.Load()
+
 	ticker := time.NewTicker(s.config.Heartbeat)
 	defer ticker.Stop()
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 1)
 
-	go func() {
-		message, err := utils.ReceiveBinaryByte(s.controlChannel)
+	s.spawn(func() {
+		message, err := utils.ReceiveBinaryByte(controlChannel)
 		if err != nil {
-			if s.cancel != nil {
+			// A cancelled context means a restart or shutdown is already in progress
+			if ctx.Err() == nil {
 				s.logger.Error("failed to read from channel connection. ", err)
 				go s.Restart()
 			}
 			return
 		}
-		messageChan <- message
-	}()
+
+		select {
+		case messageChan <- message:
+		case <-ctx.Done():
+		}
+	})
 
 	for {
 		select {
-		case <-s.ctx.Done():
-			_ = utils.SendBinaryByte(s.controlChannel, utils.SG_Closed)
+		case <-ctx.Done():
+			_ = utils.SendBinaryByte(controlChannel, utils.SG_Closed)
 			return
 
 		case <-s.reqNewConnChan:
-			err := utils.SendBinaryByte(s.controlChannel, utils.SG_Chan)
+			err := utils.SendBinaryByte(controlChannel, utils.SG_Chan)
 			if err != nil {
 				s.logger.Error("failed to send request new connection signal. ", err)
 				go s.Restart()
@@ -263,7 +284,7 @@ func (s *TcpMuxTransport) channelHandler() {
 			}
 
 		case <-ticker.C:
-			err := utils.SendBinaryByte(s.controlChannel, utils.SG_HB)
+			err := utils.SendBinaryByte(controlChannel, utils.SG_HB)
 			if err != nil {
 				s.logger.Error("failed to send heartbeat signal")
 				go s.Restart()
@@ -271,12 +292,7 @@ func (s *TcpMuxTransport) channelHandler() {
 			}
 			s.logger.Trace("heartbeat signal sent successfully")
 
-		case message, ok := <-messageChan:
-			if !ok {
-				s.logger.Error("channel closed, likely due to an error in TCP read")
-				return
-			}
-
+		case message := <-messageChan:
 			if message == utils.SG_Closed {
 				s.logger.Warn("control channel has been closed by the client")
 				go s.Restart()
@@ -287,17 +303,18 @@ func (s *TcpMuxTransport) channelHandler() {
 }
 
 func (s *TcpMuxTransport) tunnelListener() {
-	listener, err := network.ListenWithBuffers(
-		"tcp",
-		s.config.BindAddr,
-		s.config.SO_RCVBUF,
-		s.config.SO_SNDBUF,
-		s.config.MSS,
-		s.config.KeepAlive,
-		!s.config.Nodelay,
-	)
-	if err != nil {
-		s.logger.Fatalf("failed to start listener on %s: %v", s.config.BindAddr, err)
+	listener, ok := network.RetryListen(s.ctx, s.logger, s.config.BindAddr, func() (net.Listener, error) {
+		return network.ListenWithBuffers(
+			"tcp",
+			s.config.BindAddr,
+			s.config.SO_RCVBUF,
+			s.config.SO_SNDBUF,
+			s.config.MSS,
+			s.config.KeepAlive,
+			!s.config.Nodelay,
+		)
+	})
+	if !ok {
 		return
 	}
 
@@ -305,7 +322,7 @@ func (s *TcpMuxTransport) tunnelListener() {
 
 	s.logger.Infof("server started successfully, listening on address: %s", listener.Addr().String())
 
-	go s.acceptTunnelConn(listener)
+	s.spawn(func() { s.acceptTunnelConn(listener) })
 
 	<-s.ctx.Done()
 }
@@ -319,6 +336,9 @@ func (s *TcpMuxTransport) acceptTunnelConn(listener net.Listener) {
 			s.logger.Debugf("waiting for accept incoming tunnel connection on %s", listener.Addr().String())
 			conn, err := listener.Accept()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				s.logger.Debugf("failed to accept tunnel connection on %s: %v", listener.Addr().String(), err)
 				continue
 			}
@@ -331,9 +351,11 @@ func (s *TcpMuxTransport) acceptTunnelConn(listener net.Listener) {
 				continue
 			}
 
+			controlChannel := s.controlChannel.Load()
+
 			// Drop all suspicious packets from other address rather than server
-			if s.controlChannel != nil && s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String() != tcpConn.RemoteAddr().(*net.TCPAddr).IP.String() {
-				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", tcpConn.RemoteAddr().(*net.TCPAddr).IP.String(), s.controlChannel.RemoteAddr().(*net.TCPAddr).IP.String())
+			if controlChannel != nil && controlChannel.RemoteAddr().(*net.TCPAddr).IP.String() != tcpConn.RemoteAddr().(*net.TCPAddr).IP.String() {
+				s.logger.Debugf("suspicious packet from %v. expected address: %v. discarding packet...", tcpConn.RemoteAddr().(*net.TCPAddr).IP.String(), controlChannel.RemoteAddr().(*net.TCPAddr).IP.String())
 				tcpConn.Close()
 				continue
 			}
@@ -358,7 +380,7 @@ func (s *TcpMuxTransport) acceptTunnelConn(listener net.Listener) {
 			}
 
 			// try to establish a new channel
-			if s.controlChannel == nil {
+			if controlChannel == nil {
 				s.logger.Info("control channel not found, attempting to establish a new session")
 				select {
 				case s.handshakeChannel <- conn: // ok
@@ -388,100 +410,31 @@ func (s *TcpMuxTransport) acceptTunnelConn(listener net.Listener) {
 }
 
 func (s *TcpMuxTransport) parsePortMappings() {
-	for _, portMapping := range s.config.Ports {
-		parts := strings.Split(portMapping, "=")
+	mappings, err := portmap.Parse(s.config.Ports)
+	if err != nil {
+		// The configuration is validated at startup, so this should not happen
+		s.logger.Errorf("failed to parse port mappings: %v", err)
+		return
+	}
 
-		var localAddr, remoteAddr string
-
-		// Check if only a single port or a port range is provided (no "=" present)
-		if len(parts) == 1 {
-			localPortOrRange := strings.TrimSpace(parts[0])
-			remoteAddr = localPortOrRange // If no remote addr is provided, use the local port as the remote port
-
-			// Check if it's a port range
-			if strings.Contains(localPortOrRange, "-") {
-				rangeParts := strings.Split(localPortOrRange, "-")
-				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
-				}
-
-				// Parse and validate start and end ports
-				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
-				}
-
-				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
-				}
-
-				// Create listeners for all ports in the range
-				for port := startPort; port <= endPort; port++ {
-					localAddr = fmt.Sprintf(":%d", port)
-					go s.localListener(localAddr, strconv.Itoa(port)) // Use port as the remoteAddr
-					time.Sleep(1 * time.Millisecond)                  // for wide port ranges
-				}
-				continue
-			} else {
-				// Handle single port case
-				port, err := strconv.Atoi(localPortOrRange)
-				if err != nil || port < 1 || port > 65535 {
-					s.logger.Fatalf("invalid port format: %s", localPortOrRange)
-				}
-				localAddr = fmt.Sprintf(":%d", port)
-			}
-		} else if len(parts) == 2 {
-			// Handle "local=remote" format
-			localPortOrRange := strings.TrimSpace(parts[0])
-			remoteAddr = strings.TrimSpace(parts[1])
-
-			// Check if local port is a range
-			if strings.Contains(localPortOrRange, "-") {
-				rangeParts := strings.Split(localPortOrRange, "-")
-				if len(rangeParts) != 2 {
-					s.logger.Fatalf("invalid port range format: %s", localPortOrRange)
-				}
-
-				// Parse and validate start and end ports
-				startPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
-				if err != nil || startPort < 1 || startPort > 65535 {
-					s.logger.Fatalf("invalid start port in range: %s", rangeParts[0])
-				}
-
-				endPort, err := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
-				if err != nil || endPort < 1 || endPort > 65535 || endPort < startPort {
-					s.logger.Fatalf("invalid end port in range: %s", rangeParts[1])
-				}
-
-				// Create listeners for all ports in the range
-				for port := startPort; port <= endPort; port++ {
-					localAddr = fmt.Sprintf(":%d", port)
-					go s.localListener(localAddr, remoteAddr)
-					time.Sleep(1 * time.Millisecond) // for wide port ranges
-				}
-				continue
-			} else {
-				// Handle single local port case
-				port, err := strconv.Atoi(localPortOrRange)
-				if err == nil && port > 1 && port < 65535 { // format port=remoteAddress
-					localAddr = fmt.Sprintf(":%d", port)
-				} else {
-					localAddr = localPortOrRange // format ip:port=remoteAddress
-				}
-			}
-		} else {
-			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
+	for _, m := range mappings {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
 		}
-		// Start listeners for single port
-		go s.localListener(localAddr, remoteAddr)
+
+		localAddr, remoteAddr := m.LocalAddr, m.RemoteAddr
+		s.spawn(func() { s.localListener(localAddr, remoteAddr) })
+		time.Sleep(1 * time.Millisecond) // for wide port ranges
 	}
 }
 
 func (s *TcpMuxTransport) localListener(localAddr string, remoteAddr string) {
-	listener, err := net.Listen("tcp", localAddr)
-	if err != nil {
-		s.logger.Fatalf("failed to start listener on %s: %v", localAddr, err)
+	listener, ok := network.RetryListen(s.ctx, s.logger, localAddr, func() (net.Listener, error) {
+		return net.Listen("tcp", localAddr)
+	})
+	if !ok {
 		return
 	}
 
@@ -489,7 +442,7 @@ func (s *TcpMuxTransport) localListener(localAddr string, remoteAddr string) {
 
 	s.logger.Infof("listener started successfully, listening on address: %s", listener.Addr().String())
 
-	go s.acceptLocalConn(listener, remoteAddr)
+	s.spawn(func() { s.acceptLocalConn(listener, remoteAddr) })
 
 	<-s.ctx.Done()
 }
@@ -503,6 +456,9 @@ func (s *TcpMuxTransport) acceptLocalConn(listener net.Listener, remoteAddr stri
 		default:
 			conn, err := listener.Accept()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				s.logger.Debugf("failed to accept connection on %s: %v", listener.Addr().String(), err)
 				continue
 			}
@@ -561,25 +517,33 @@ func (s *TcpMuxTransport) handleLoop() {
 			// +1 for session counter
 			atomic.AddInt32(&s.sessionCounter, 1)
 
-			go s.handleSession(session)
+			s.spawn(func() { s.handleSession(session) })
 		}
 	}
 }
 
 func (s *TcpMuxTransport) handleSession(session *smux.Session) {
+	// Captured once, so the stream goroutines below never read fields that Restart replaces
+	ctx := s.ctx
+	usageMonitor := s.usageMonitor
+	localChannel := s.localChannel
+
 	counter := make(chan struct{}, s.config.MuxCon)
 	defer session.Close()
-	defer close(counter)
 
 	for {
 		// +1 for mux connection counter
-		counter <- struct{}{}
+		select {
+		case counter <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
 
-		case incomingConn := <-s.localChannel:
+		case incomingConn := <-localChannel:
 			if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
 				s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
 				incomingConn.conn.Close()
@@ -592,21 +556,23 @@ func (s *TcpMuxTransport) handleSession(session *smux.Session) {
 
 			stream, err := session.OpenStream()
 			if err != nil {
-				s.handleSessionError(&incomingConn, err)
+				s.handleSessionError(ctx, localChannel, &incomingConn, err)
 				return
 			}
 
 			// Send the target port over the tunnel connection
 			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
 				s.logger.Tracef("failed to send address over stream: %v", err)
+				stream.Close()
+				<-counter
 				// Put local connection back to local channel
-				s.localChannel <- incomingConn
+				s.requeue(ctx, localChannel, &incomingConn)
 				continue
 			}
 
 			// Handle data exchange between connections
 			go func() {
-				handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+				handlers.TCPConnectionHandler(ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 				atomic.AddInt32(&s.streamCounter, -1)
 				<-counter // read signal from the channel
 			}()
@@ -614,19 +580,33 @@ func (s *TcpMuxTransport) handleSession(session *smux.Session) {
 	}
 }
 
-func (s *TcpMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err error) {
+func (s *TcpMuxTransport) handleSessionError(ctx context.Context, localChannel chan LocalTCPConn, incomingConn *LocalTCPConn, err error) {
 	s.logger.Tracef("failed to handle session: %v", err)
 
 	// decrease session value
 	atomic.AddInt32(&s.sessionCounter, -1)
 
 	// Put local connection back to local channel
-	s.localChannel <- *incomingConn
+	s.requeue(ctx, localChannel, incomingConn)
 
 	// Attempt to request a new connection
 	select {
 	case s.reqNewConnChan <- struct{}{}:
 	default:
 		s.logger.Warn("request new connection channel is full")
+	}
+}
+
+// requeue puts a local connection back for another session, or closes it when that is not possible.
+func (s *TcpMuxTransport) requeue(ctx context.Context, localChannel chan LocalTCPConn, incomingConn *LocalTCPConn) {
+	select {
+	case localChannel <- *incomingConn:
+	case <-ctx.Done():
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
+	default:
+		s.logger.Warn("local channel is full, discarding local connection")
+		incomingConn.conn.Close()
+		atomic.AddInt32(&s.streamCounter, -1)
 	}
 }

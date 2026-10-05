@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -14,15 +15,19 @@ import (
 const BufferSize = 16 * 1024
 
 func UDPDialer(tcp net.Conn, remoteAddr string, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+	defer tcp.Close()
+
 	remoteUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
 	if err != nil {
-		logger.Fatalf("failed to resolve remote address: %v", err)
+		logger.Errorf("failed to resolve remote address %s: %v", remoteAddr, err)
+		return
 	}
 
 	// Dial the remote UDP server
 	remoteConn, err := net.DialUDP("udp", nil, remoteUDPAddr)
 	if err != nil {
-		logger.Fatalf("failed to dial remote UDP address: %v", err)
+		logger.Errorf("failed to dial remote UDP address %s: %v", remoteAddr, err)
+		return
 	}
 
 	defer remoteConn.Close()
@@ -30,11 +35,16 @@ func UDPDialer(tcp net.Conn, remoteAddr string, logger *logrus.Logger, usage *we
 	done := make(chan struct{})
 
 	go func() {
-		go tcpToUDP(tcp, remoteConn, logger, usage, remotePort, sniffer)
-		done <- struct{}{}
+		defer close(done)
+		tcpToUDP(tcp, remoteConn, logger, usage, remotePort, sniffer)
+		// Unblock the UDP reader below
+		remoteConn.Close()
 	}()
 
 	udpToTCP(tcp, remoteConn, logger, usage, remotePort, sniffer)
+
+	// Unblock the TCP reader above
+	tcp.Close()
 
 	<-done
 }
@@ -100,7 +110,11 @@ func udpToTCP(tcp net.Conn, udp *net.UDPConn, logger *logrus.Logger, usage *web.
 	for {
 		r, err := udp.Read(buf)
 		if err != nil {
-			logger.Errorf("failed to read from UDP connection: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				logger.Debug("UDP connection closed.")
+			} else {
+				logger.Errorf("failed to read from UDP connection: %v", err)
+			}
 			return
 		}
 

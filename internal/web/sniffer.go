@@ -4,14 +4,18 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
+	stdnet "net"
 	"net/http"
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/shirou/gopsutil/v4/mem"
@@ -30,8 +34,8 @@ type Usage struct {
 	sniffer      bool
 	snifferLog   string
 	mu           sync.Mutex
-	totalTraffic uint64
-	tunnelStatus *string
+	totalTraffic atomic.Uint64
+	tunnelStatus atomic.Pointer[string]
 }
 
 type PortUsage struct {
@@ -53,20 +57,23 @@ type SystemStats struct {
 	AllConnections  string `json:"allConnections"`
 }
 
-func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog string, sniffer bool, tunnelStatus *string, logger *logrus.Logger) *Usage {
+func NewDataStore(listenAddr string, shutdownCtx context.Context, snifferLog string, sniffer bool, logger *logrus.Logger) *Usage {
 	ctx, cancel := context.WithCancel(shutdownCtx)
 	u := &Usage{
-		listenAddr:   listenAddr,
-		shutdownCtx:  ctx,
-		cancelFunc:   cancel,
-		logger:       logger,
-		sniffer:      sniffer,
-		snifferLog:   snifferLog,
-		tunnelStatus: tunnelStatus,
-		mu:           sync.Mutex{},
-		totalTraffic: 0,
+		listenAddr:  listenAddr,
+		shutdownCtx: ctx,
+		cancelFunc:  cancel,
+		logger:      logger,
+		sniffer:     sniffer,
+		snifferLog:  snifferLog,
 	}
+	u.SetStatus("")
 	return u
+}
+
+// SetStatus sets the tunnel status shown in the web interface.
+func (m *Usage) SetStatus(status string) {
+	m.tunnelStatus.Store(&status)
 }
 
 func (m *Usage) Monitor() {
@@ -96,22 +103,30 @@ func (m *Usage) Monitor() {
 	// start save data
 	if m.sniffer {
 		go func() {
-			ticker := time.NewTicker(15 * time.Second) // every 5 seconds
+			ticker := time.NewTicker(15 * time.Second) // every 15 seconds
 			defer ticker.Stop()
 
 			for {
 				select {
 				case <-ticker.C:
-					go m.saveUsageData()
+					m.saveUsageData()
 				case <-m.shutdownCtx.Done():
 					return
 				}
 			}
 		}()
 	}
-	// Start the server
+
+	// Start the server, retrying while the port is busy (e.g. during a restart)
+	listener, ok := network.RetryListen(m.shutdownCtx, m.logger, "web interface "+m.listenAddr, func() (stdnet.Listener, error) {
+		return stdnet.Listen("tcp", m.listenAddr)
+	})
+	if !ok {
+		return
+	}
+
 	m.logger.Info("sniffer service listening on port: ", m.listenAddr)
-	if err := m.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := m.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		m.logger.Errorf("sniffer server error: %v", err)
 	}
 }
@@ -216,14 +231,14 @@ func (m *Usage) saveUsageData() {
 		}
 	}
 
-	m.totalTraffic = 0
-
 	// Step 4: Convert the map back to a slice
 	var mergedUsageData []PortUsage
+	var totalTraffic uint64
 	for _, usage := range usageMap {
 		mergedUsageData = append(mergedUsageData, usage)
-		m.totalTraffic += usage.Usage
+		totalTraffic += usage.Usage
 	}
+	m.totalTraffic.Store(totalTraffic)
 
 	// Step 5: Convert merged data to JSON
 	data, err := json.MarshalIndent(mergedUsageData, "", "  ")
@@ -404,7 +419,7 @@ func (m *Usage) getSystemStats() (*SystemStats, error) {
 	downloadSpeed := float64(finalStats.BytesRecv - initialStats.BytesRecv)
 
 	stats := &SystemStats{
-		TunnelStatus:    *m.tunnelStatus,
+		TunnelStatus:    *m.tunnelStatus.Load(),
 		CPUUsage:        m.formatFloat(cpuPercent[0]),
 		RAMUsage:        m.convertBytesToReadable(memStats.Used),
 		DiskUsage:       m.convertBytesToReadable(diskStats.Used),
@@ -412,7 +427,7 @@ func (m *Usage) getSystemStats() (*SystemStats, error) {
 		NetworkTraffic:  m.convertBytesToReadable(netStats[0].BytesSent + netStats[0].BytesRecv),
 		DownloadSpeed:   m.formatSpeed(downloadSpeed),
 		UploadSpeed:     m.formatSpeed(uploadSpeed),
-		BackhaulTraffic: m.convertBytesToReadable(m.totalTraffic),
+		BackhaulTraffic: m.convertBytesToReadable(m.totalTraffic.Load()),
 		Sniffer:         map[bool]string{true: "Running", false: "Not running"}[m.sniffer],
 		AllConnections:  fmt.Sprintf("%d", len(connections)),
 	}

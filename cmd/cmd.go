@@ -2,12 +2,16 @@ package cmd
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
 
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/client"
 
 	"github.com/musix/backhaul/internal/server"
 	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/portmap"
 
 	"github.com/BurntSushi/toml"
 )
@@ -16,28 +20,77 @@ var (
 	logger = utils.NewLogger("info")
 )
 
-func Run(configPath string, ctx context.Context) {
-	// Load and parse the configuration file
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		logger.Fatalf("failed to load configuration: %v", err)
+// Load reads, defaults and validates the configuration file.
+func Load(configPath string) (*config.Config, error) {
+	var cfg config.Config
+	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse %s: %w", configPath, err)
 	}
 
 	// Apply default values to the configuration
-	applyDefaults(cfg)
+	applyDefaults(&cfg)
 
-	configType := ""
-	if cfg.Server.BindAddr != "" {
-		configType = "server"
-	} else if cfg.Client.RemoteAddr != "" {
-		configType = "client"
-	} else {
-		logger.Fatalf("neither server nor client configuration is properly set.")
+	if err := validate(&cfg); err != nil {
+		return nil, err
 	}
 
+	return &cfg, nil
+}
+
+func validate(cfg *config.Config) error {
+	switch {
+	case cfg.Server.BindAddr != "":
+		if !validTransport(cfg.Server.Transport) {
+			return fmt.Errorf("invalid server transport type: %q", cfg.Server.Transport)
+		}
+
+		if _, err := portmap.Parse(cfg.Server.Ports); err != nil {
+			return err
+		}
+
+		if cfg.Server.Transport == config.WSS || cfg.Server.Transport == config.WSSMUX {
+			if err := fileExists("tls_cert", cfg.Server.TLSCertFile); err != nil {
+				return err
+			}
+			if err := fileExists("tls_key", cfg.Server.TLSKeyFile); err != nil {
+				return err
+			}
+		}
+
+	case cfg.Client.RemoteAddr != "":
+		if !validTransport(cfg.Client.Transport) {
+			return fmt.Errorf("invalid client transport type: %q", cfg.Client.Transport)
+		}
+
+	default:
+		return errors.New("neither server nor client configuration is properly set")
+	}
+
+	return nil
+}
+
+func validTransport(t config.TransportType) bool {
+	switch t {
+	case config.TCP, config.TCPMUX, config.WS, config.WSS, config.WSMUX, config.WSSMUX, config.UDP:
+		return true
+	}
+	return false
+}
+
+func fileExists(option, path string) error {
+	if path == "" {
+		return fmt.Errorf("%s is required for wss/wssmux transports", option)
+	}
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("%s: %w", option, err)
+	}
+	return nil
+}
+
+// Run starts a validated configuration (see Load) and blocks until ctx is done.
+func Run(cfg *config.Config, ctx context.Context) {
 	// Determine whether to run as a server or client
-	switch configType {
-	case "server":
+	if cfg.Server.BindAddr != "" {
 		// Apply temporary TCP optimizations at startup
 		if !cfg.Server.SkipOptz {
 			ApplyTCPTuning()
@@ -50,31 +103,19 @@ func Run(configPath string, ctx context.Context) {
 		<-ctx.Done()
 		srv.Stop()
 		logger.Println("shutting down server...")
-	case "client":
-		// Apply temporary TCP optimizations at startup
-		if !cfg.Client.SkipOptz {
-			ApplyTCPTuning()
-		}
-
-		clnt := client.NewClient(&cfg.Client, ctx) // client
-		go clnt.Start()
-
-		// Wait for shutdown signal
-		<-ctx.Done()
-		clnt.Stop()
-		logger.Println("shutting down client...")
-
-	default:
-		logger.Fatalf("neither server nor client configuration is properly set.")
-
+		return
 	}
-}
 
-// loadConfig loads and parses the TOML configuration file.
-func loadConfig(configPath string) (*config.Config, error) {
-	var cfg config.Config
-	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
-		return &cfg, err
+	// Apply temporary TCP optimizations at startup
+	if !cfg.Client.SkipOptz {
+		ApplyTCPTuning()
 	}
-	return &cfg, nil
+
+	clnt := client.NewClient(&cfg.Client, ctx) // client
+	go clnt.Start()
+
+	// Wait for shutdown signal
+	<-ctx.Done()
+	clnt.Stop()
+	logger.Println("shutting down client...")
 }
